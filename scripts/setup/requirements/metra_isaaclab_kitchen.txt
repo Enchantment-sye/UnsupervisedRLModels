@@ -1,0 +1,4 @@
+cython<3
+d4rl==1.1
+mjrl==1.0.0
+mujoco-py==2.1.2.14
