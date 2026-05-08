@@ -33,6 +33,16 @@ def _cfg(enabled):
         eval_structure_metrics_anchor_seed=0,
         eval_structure_metrics_max_points=60,
         eval_structure_metrics_states_per_traj=3,
+        eval_structure_metrics_reset_perturb_scale=0.0,
+        eval_structure_metrics_degenerate_policy="skip",
+        eval_record_video=0,
+        num_video_repeats=2,
+        render_size=4,
+        video_skip_frames=1,
+        motion_analysis=SimpleNamespace(enabled=False),
+        encoder=0,
+        sac_discount=0.99,
+        stage="pre_training",
         discrete=True,
         dim_skill=2,
         unit_length=True,
@@ -120,3 +130,90 @@ def test_compute_exception_fail_open_writes_skipped_tags(monkeypatch):
     assert writer.scalars["eval/StructureMetricsSkipReasonCode"] == 11.0
     assert writer.scalars["eval/StructureMetricsTemporalSkipped"] == 1.0
     assert writer.scalars["eval/StructureMetricsIKSkipped"] == 1.0
+
+
+def test_video_eval_uses_deterministic_policy(monkeypatch):
+    adapter = _adapter(False)
+    adapter.cfg.eval_record_video = 1
+    adapter.cfg.dim_skill = 2
+    calls = []
+
+    coverage_trajectory = {
+        "observations": np.zeros((1, 2), dtype=np.float32),
+        "next_observations": np.zeros((1, 2), dtype=np.float32),
+        "actions": np.zeros((1, 1), dtype=np.float32),
+        "rewards": np.zeros(1, dtype=np.float32),
+        "dones": np.ones(1, dtype=bool),
+        "agent_infos": {},
+        "env_infos": {},
+    }
+    monkeypatch.setattr(adapter, "collect_policy_coverage_trajectories", lambda total_epoch: [coverage_trajectory])
+    monkeypatch.setattr(adapter, "_log_d4rl_kitchen_eval_metrics", lambda *args, **kwargs: None)
+    monkeypatch.setattr(adapter, "compute_policy_coverage_metrics", lambda trajectories: {})
+    monkeypatch.setattr(adapter, "log_policy_coverage_metrics_to_writer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(task_adapter_module.utils, "log_performance_ex", lambda *args, **kwargs: {"scalars": {}})
+    monkeypatch.setattr(task_adapter_module.utils, "record_video", lambda *args, **kwargs: None)
+
+    def _collect(extras, **kwargs):
+        calls.append(kwargs)
+        return [
+            {
+                "observations": np.zeros((1, 2), dtype=np.float32),
+                "next_observations": np.zeros((1, 2), dtype=np.float32),
+                "actions": np.zeros((1, 1), dtype=np.float32),
+                "rewards": np.zeros(1, dtype=np.float32),
+                "dones": np.ones(1, dtype=bool),
+                "agent_infos": {},
+                "env_infos": {},
+            }
+            for _ in extras
+        ]
+
+    monkeypatch.setattr(adapter, "collect_policy_trajectories", _collect)
+
+    adapter._evaluate_impl(1, 7, _Writer(), log_policy_coverage_to_writer=True)
+
+    assert calls
+    assert calls[-1]["deterministic_policy"] is True
+    assert calls[-1]["state_record_pixeled"] is True
+
+
+def test_structure_metrics_perturbation_forces_extra_deterministic_rollouts(monkeypatch):
+    adapter = _adapter(True)
+    adapter.cfg.task = "d4rl_kitchen"
+    adapter.cfg.eval_structure_metrics_reset_perturb_scale = 1e-4
+    calls = []
+
+    def _collect(extras, **kwargs):
+        calls.append((list(extras), kwargs))
+        return [
+            {
+                "observations": np.zeros((3, 2), dtype=np.float32),
+                "next_observations": np.zeros((3, 2), dtype=np.float32),
+                "actions": np.zeros((3, 1), dtype=np.float32),
+                "rewards": np.zeros(3, dtype=np.float32),
+                "dones": np.zeros(3, dtype=bool),
+                "agent_infos": {"skill": np.repeat(extra["skill"][None, :], 3, axis=0)},
+                "env_infos": {},
+            }
+            for extra in extras
+        ]
+
+    monkeypatch.setattr(adapter, "collect_policy_trajectories", _collect)
+    video_trajectories = [{"agent_infos": {"skill": np.eye(2, dtype=np.float32)[0][None, :]}} for _ in range(6)]
+
+    trajectories, options, skill_ids, source_metrics = adapter._collect_structure_metric_trajectories(
+        3,
+        video_trajectories=video_trajectories,
+        video_policy_mode="deterministic",
+    )
+
+    assert len(trajectories) == 6
+    assert options.shape[0] == 6
+    assert skill_ids.tolist() == [0, 0, 0, 1, 1, 1]
+    assert source_metrics["StructureMetricsUsedVideoTrajectories"] == 0.0
+    assert source_metrics["StructureMetricsUsedExtraRollouts"] == 1.0
+    assert source_metrics["StructureMetricsResetPerturbedRollouts"] == 1.0
+    assert calls[0][1]["deterministic_policy"] is True
+    assert len(calls[0][1]["reset_perturbations"]) == 6
+    assert calls[0][1]["reset_perturbations"][0][1] == 1e-4

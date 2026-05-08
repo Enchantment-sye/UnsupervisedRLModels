@@ -125,7 +125,9 @@ class GalaxeaSimProcessTrajectoryCollector:
             deterministic_policy: bool,
             state_record_pixeled: bool = False,
             video_frame_source=None,
+            reset_perturbations=None,
     ):
+        del reset_perturbations
         extras = list(extras)
         if not extras:
             return []

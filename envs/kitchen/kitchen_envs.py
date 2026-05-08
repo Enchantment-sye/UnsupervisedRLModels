@@ -1,8 +1,11 @@
 """Environments using kitchen and Franka robot."""
+import os
+
 import numpy as np
 from gym import spaces
 from gym.spaces.box import Box
 
+from envs.kitchen.mujoco_compat import get_mujoco_compatible_kitchen_model
 from d4rl.kitchen.adept_envs.franka.kitchen_multitask_v0 import KitchenTaskRelaxV1
 
 OBS_ELEMENT_INDICES = {
@@ -26,6 +29,17 @@ OBS_ELEMENT_GOALS = {
 BONUS_THRESH = 0.3
 
 
+def _get_compatible_control_modes(control_modes):
+    patched_modes = {}
+    for mode, config in control_modes.items():
+        patched_config = dict(config)
+        model = patched_config.get("model")
+        if model and os.path.isfile(model):
+            patched_config["model"] = get_mujoco_compatible_kitchen_model(model)
+        patched_modes[mode] = patched_config
+    return patched_modes
+
+
 class KitchenBase(KitchenTaskRelaxV1):
     # A string of element names. The robot's task is then to modify each of
     # these elements appropriately.
@@ -36,6 +50,7 @@ class KitchenBase(KitchenTaskRelaxV1):
     def __init__(self, dense=True, use_combined_action_space=False, **kwargs):
         self.tasks_to_complete = set(self.TASK_ELEMENTS)
         self.dense = dense
+        self.CTLR_MODES_DICT = _get_compatible_control_modes(self.CTLR_MODES_DICT)
         super(KitchenBase, self).__init__(**kwargs)
         combined_action_space_low = -1.4 * np.ones(self.max_arg_len)
         combined_action_space_high = 1.4 * np.ones(self.max_arg_len)

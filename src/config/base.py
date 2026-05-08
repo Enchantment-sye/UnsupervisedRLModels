@@ -64,6 +64,8 @@ class LogConfig:
     eval_structure_metrics_anchor_seed: int = 0
     eval_structure_metrics_use_video_trajectories: bool = True
     eval_structure_metrics_policy_mode: str = 'deterministic'
+    eval_structure_metrics_reset_perturb_scale: float = 0.0
+    eval_structure_metrics_degenerate_policy: str = 'skip'
     eval_structure_metrics_fail_open: bool = True
     eval_structure_metrics_write_legacy_tags: bool = False
 
@@ -242,6 +244,14 @@ class TrainConfig:
     policy_delay: int = 1
     actor_start_steps: int = 0
     skill_policy_path: str = ''
+    parallel_sampler_enabled: bool = True
+    parallel_sampler_num_workers: int = 0
+    parallel_sampler_fail_open: bool = True
+    eval_parallel_sampler_enabled: bool = True
+    eval_video_parallel_sampler_enabled: bool = True
+    async_video_encoding: bool = True
+    replay_staging_enabled: bool = True
+    replay_staging_pin_memory: bool = True
 
 @dataclass
 class MetraConfig:

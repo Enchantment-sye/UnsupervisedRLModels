@@ -1,6 +1,7 @@
 import cv2
-import os
-os.environ["MUJOCO_GL"] = "egl"
+from envs.kitchen.mujoco_compat import configure_kitchen_mujoco_runtime
+
+configure_kitchen_mujoco_runtime()
 import akro
 import gym
 import d4rl  # 确保注册
@@ -105,4 +106,3 @@ class MyKitchenEnv(KitchenEnv):
 
     def calc_eval_metrics(self, trajectories, is_option_trajectories=True, coord_dims=None):
         return calc_kitchen_eval_metrics(trajectories)
-

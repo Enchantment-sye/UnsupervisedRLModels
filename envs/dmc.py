@@ -284,7 +284,7 @@ class DMC:
     def calc_eval_metrics(self, trajectories, is_option_trajectories=False):
         coord_dim = 2 if self._domain in ("quadruped", "humanoid") else 1
         return compute_locomotion_coverage_metrics(trajectories, coord_dim)
-    
+
     def render(self, mode='offscreen'):
         if not self._render_image:
             image = np.zeros(self._size + (3,), dtype=np.uint8)
@@ -341,7 +341,7 @@ class RandomVideoSource:
                         if self.grayscale:
                             self.arr[total_frame_i] = cv2.resize(frames[frame_i], (self.shape[1], self.shape[0]))[..., None] ## THIS IS NOT A BUG! cv2 uses (width, height)
                         else:
-                            self.arr[total_frame_i] = cv2.resize(frames[frame_i], (self.shape[1], self.shape[0])) 
+                            self.arr[total_frame_i] = cv2.resize(frames[frame_i], (self.shape[1], self.shape[0]))
                         pbar.update(1)
                         total_frame_i += 1
 
@@ -386,7 +386,7 @@ class RandomVideoSource:
 
     def __getattr__(self, name):
         return getattr(self._env, name)
-    
+
     def _extract_pixels(self, obs):
         pixels = obs[self._pixels_key]
         # remove batch dim

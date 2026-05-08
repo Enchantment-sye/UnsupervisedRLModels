@@ -86,6 +86,10 @@ class MetraAgent:
         self.current_skill_level = 1
         self.best_skill = None
         self._last_replay_transfer_seconds = 0.0
+        self._last_replay_sample_seconds = 0.0
+        self._last_replay_stage_seconds = 0.0
+        self._last_replay_h2d_seconds = 0.0
+        self._replay_tensor_stager = None
 
     @property
     def kme_vector(self):
@@ -156,6 +160,9 @@ class MetraAgent:
         metrics = {}
         self._ensure_train_diagnostic_defaults(metrics)
         total_replay_transfer = 0.0
+        total_replay_sample = 0.0
+        total_replay_stage = 0.0
+        total_replay_h2d = 0.0
         for _ in range(self.cfg.train.trans_optimization_epochs):
             self.total_train_steps += 1
             
@@ -165,6 +172,9 @@ class MetraAgent:
             else:
                 v = self._sample_replay_buffer()
                 total_replay_transfer += float(getattr(self, "_last_replay_transfer_seconds", 0.0))
+                total_replay_sample += float(getattr(self, "_last_replay_sample_seconds", 0.0))
+                total_replay_stage += float(getattr(self, "_last_replay_stage_seconds", 0.0))
+                total_replay_h2d += float(getattr(self, "_last_replay_h2d_seconds", 0.0))
 
             self._normalize_sac_scalars(v)
                 
@@ -187,6 +197,9 @@ class MetraAgent:
 
         if self.replay_buffer is not None:
             metrics["TimeReplayTransfer"] = total_replay_transfer
+            metrics["TimeReplaySample"] = total_replay_sample
+            metrics["TimeReplayStage"] = total_replay_stage
+            metrics["TimeReplayH2D"] = total_replay_h2d
                 
         return metrics
 
@@ -329,20 +342,45 @@ class MetraAgent:
                 self.replay_buffer.add_path(path)
 
     def _sample_replay_buffer(self):
-        transfer_started = time.perf_counter()
+        sample_started = time.perf_counter()
         samples = self.replay_buffer.sample_transitions(self.cfg.train.trans_minibatch_size)
+        sample_sec = time.perf_counter() - sample_started
         data = {}
         non_blocking = bool(torch.cuda.is_available() and str(self.device).startswith("cuda"))
-        for key, value in samples.items():
-            if value.shape[1] == 1 and 'skill' not in key:
-                value = np.squeeze(value, axis=1)
-            data[key] = agent_utils.numpy_batch_to_torch(
-                value,
-                self.device,
-                dtype=torch.float32,
-                non_blocking=non_blocking,
+        stage_sec = 0.0
+        h2d_sec = 0.0
+        use_staging = bool(getattr(self.cfg, "replay_staging_enabled", False))
+        if use_staging and self._replay_tensor_stager is None:
+            self._replay_tensor_stager = agent_utils.ReplayTensorStager(
+                pin_memory=bool(getattr(self.cfg, "replay_staging_pin_memory", True)),
             )
-        self._last_replay_transfer_seconds = time.perf_counter() - transfer_started
+        for key, value in samples.items():
+            if value.ndim >= 2 and value.shape[1] == 1 and 'skill' not in key:
+                value = np.squeeze(value, axis=1)
+            if use_staging:
+                tensor, cur_stage_sec, cur_h2d_sec = self._replay_tensor_stager.to_torch(
+                    key,
+                    value,
+                    self.device,
+                    dtype=torch.float32,
+                )
+            else:
+                cur_stage_sec = 0.0
+                h2d_started = time.perf_counter()
+                tensor = agent_utils.numpy_batch_to_torch(
+                    value,
+                    self.device,
+                    dtype=torch.float32,
+                    non_blocking=non_blocking,
+                )
+                cur_h2d_sec = time.perf_counter() - h2d_started
+            data[key] = tensor
+            stage_sec += float(cur_stage_sec)
+            h2d_sec += float(cur_h2d_sec)
+        self._last_replay_sample_seconds = sample_sec
+        self._last_replay_stage_seconds = stage_sec
+        self._last_replay_h2d_seconds = h2d_sec
+        self._last_replay_transfer_seconds = sample_sec + stage_sec + h2d_sec
         return data
 
     @torch.no_grad()

@@ -125,6 +125,14 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument('--traj_batch_size', type=int, default=8)
     parser.add_argument('--trans_minibatch_size', type=int, default=256)
     parser.add_argument('--trans_optimization_epochs', type=int, default=200)
+    parser.add_argument('--parallel_sampler_enabled', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--parallel_sampler_num_workers', type=int, default=0)
+    parser.add_argument('--parallel_sampler_fail_open', type=int, default=1, choices=[0, 1])
+    parser.add_argument('--eval_parallel_sampler_enabled', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--eval_video_parallel_sampler_enabled', type=int, default=1, choices=[0, 1])
+    parser.add_argument('--async_video_encoding', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--replay_staging_enabled', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--replay_staging_pin_memory', type=int, default=1, choices=[0, 1])
 
     parser.add_argument('--n_epochs_per_eval', type=int, default=125)
     parser.add_argument('--n_epochs_per_log', type=int, default=25)
@@ -151,6 +159,8 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument('--eval_structure_metrics_anchor_seed', type=int, default=0)
     parser.add_argument('--eval_structure_metrics_use_video_trajectories', type=int, default=1, choices=[0, 1])
     parser.add_argument('--eval_structure_metrics_policy_mode', type=str, default='deterministic', choices=['deterministic', 'stochastic'])
+    parser.add_argument('--eval_structure_metrics_reset_perturb_scale', type=float, default=0.0)
+    parser.add_argument('--eval_structure_metrics_degenerate_policy', type=str, default='skip', choices=['skip', 'warn_compute'])
     parser.add_argument('--eval_structure_metrics_fail_open', type=int, default=1, choices=[0, 1])
     parser.add_argument('--eval_structure_metrics_write_legacy_tags', type=int, default=0, choices=[0, 1])
     parser.add_argument('--num_video_repeats', type=int, default=2)
@@ -427,6 +437,16 @@ def make_config_from_args(args, cls=MetraConfig) -> MetraConfig:
         raise ValueError("auto_branch.min_branch_age must be >= 0")
     if cfg.auto_branch.fresh_rollout_episodes < 1:
         raise ValueError("auto_branch.fresh_rollout_episodes must be >= 1")
+    if cfg.train.n_parallel < 1:
+        raise ValueError("n_parallel must be >= 1")
+    if cfg.train.parallel_sampler_num_workers < 0:
+        raise ValueError("parallel_sampler_num_workers must be >= 0")
+    if cfg.train.traj_batch_size < 1:
+        raise ValueError("traj_batch_size must be >= 1")
+    if cfg.train.trans_minibatch_size < 1:
+        raise ValueError("trans_minibatch_size must be >= 1")
+    if cfg.train.trans_optimization_epochs < 1:
+        raise ValueError("trans_optimization_epochs must be >= 1")
     if cfg.log.metric_num_sampled_points < 1:
         raise ValueError("metric_num_sampled_points must be >= 1")
     if not isinstance(cfg.log.ikse, bool):
@@ -470,6 +490,10 @@ def make_config_from_args(args, cls=MetraConfig) -> MetraConfig:
         raise ValueError("eval_structure_metrics_states_per_traj must be >= 1")
     if cfg.log.eval_structure_metrics_policy_mode not in ('deterministic', 'stochastic'):
         raise ValueError("eval_structure_metrics_policy_mode must be deterministic or stochastic")
+    if cfg.log.eval_structure_metrics_reset_perturb_scale < 0:
+        raise ValueError("eval_structure_metrics_reset_perturb_scale must be >= 0")
+    if cfg.log.eval_structure_metrics_degenerate_policy not in ('skip', 'warn_compute'):
+        raise ValueError("eval_structure_metrics_degenerate_policy must be skip or warn_compute")
     if cfg.motion_analysis.resize_h < 1 or cfg.motion_analysis.resize_w < 1:
         raise ValueError("motion_analysis resize_h/resize_w must be >= 1")
     if cfg.motion_analysis.blur_kernel < 1:

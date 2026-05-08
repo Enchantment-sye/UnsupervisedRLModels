@@ -13,13 +13,14 @@ from core.metrics.trajectory_structure import (
 )
 
 
-def _cfg():
+def _cfg(policy_mode="stochastic", degenerate_policy="skip"):
     return SimpleNamespace(
         eval_structure_metrics_states_per_traj=3,
         eval_structure_metrics_max_points=100,
         eval_structure_metrics_anchor_seed=1,
         eval_structure_metrics_rollouts_per_skill=3,
-        eval_structure_metrics_policy_mode="stochastic",
+        eval_structure_metrics_policy_mode=policy_mode,
+        eval_structure_metrics_degenerate_policy=degenerate_policy,
         temporal_graph_knn_k=2,
         soft_dtw_gamma=1.0,
     )
@@ -106,3 +107,39 @@ def test_video_trajectories_not_suitable_skip_code():
     assert suitable is False
     assert reason == int(SkipReason.VIDEO_TRAJECTORIES_NOT_SUITABLE)
     assert labels is None
+
+
+def test_deterministic_degenerate_repeats_skip_by_default():
+    trajectories = [_traj(0, 0.0) for _ in range(3)]
+    trajectories += [_traj(1, 2.0) for _ in range(3)]
+    metrics = compute_training_eval_structure_metrics(
+        trajectories,
+        skill_ids=np.asarray([0, 0, 0, 1, 1, 1]),
+        cfg=_cfg(policy_mode="deterministic", degenerate_policy="skip"),
+        env_name="ant",
+        backends="temporal",
+    )
+
+    assert metrics["StructureMetricsDegenerateRepeats"] == 1.0
+    assert metrics["StructureMetricsDegeneratePolicyWarnCompute"] == 0.0
+    assert metrics["StructureMetricsTemporalSkipped"] == 1.0
+    assert metrics["StructureMetricsTemporalSkipReasonCode"] == float(SkipReason.DETERMINISTIC_REPEATS_DEGENERATE)
+
+
+def test_deterministic_degenerate_repeats_warn_compute_continues_dbi():
+    trajectories = [_traj(0, 0.0) for _ in range(3)]
+    trajectories += [_traj(1, 2.0) for _ in range(3)]
+    metrics = compute_training_eval_structure_metrics(
+        trajectories,
+        skill_ids=np.asarray([0, 0, 0, 1, 1, 1]),
+        cfg=_cfg(policy_mode="deterministic", degenerate_policy="warn_compute"),
+        env_name="ant",
+        backends="temporal",
+    )
+
+    assert metrics["StructureMetricsDegenerateRepeats"] == 1.0
+    assert metrics["StructureMetricsDegeneratePolicyWarnCompute"] == 1.0
+    assert metrics["StructureMetricsTemporalDegenerateWarnCompute"] == 1.0
+    assert metrics["StructureMetricsTemporalSkipped"] == 0.0
+    assert metrics["StructureMetricsTemporalSkipReasonCode"] == float(SkipReason.OK)
+    assert "DBI_TemporalMedoid_XY" in metrics

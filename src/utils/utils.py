@@ -2,7 +2,9 @@ import math
 import os
 import random
 import cv2
+import atexit
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import pathlib
 import numpy as np
 import scipy.linalg as sp_la
@@ -24,6 +26,8 @@ import sys
 
 _g_session = None
 _g_context = {}
+_async_video_executor = None
+_async_video_futures = []
 
 try:
     from moviepy import editor as mpy
@@ -636,11 +640,61 @@ def trajectories_to_video_tensor(trajectories, skip_frames=1, shape=(64, 64)):
     return renders
 
 
-def record_video(snapshot_dir, step_itr, label, trajectories, n_cols=None, skip_frames=1, shape=(64, 64)):
+def _warn_async_video(logger, message, *args):
+    if logger is not None and hasattr(logger, "warning"):
+        logger.warning(message, *args)
+    else:
+        print(message % args if args else message)
+
+
+def _get_async_video_executor():
+    global _async_video_executor
+    if _async_video_executor is None:
+        _async_video_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="metra-video")
+    return _async_video_executor
+
+
+def _save_video_async_job(snapshot_dir, step_itr, label, renders, n_cols):
+    save_video(snapshot_dir, step_itr, label, renders, n_cols=n_cols)
+
+
+def flush_async_video_encoding(logger=None):
+    global _async_video_executor, _async_video_futures
+    pending = list(_async_video_futures)
+    _async_video_futures = []
+    for future in pending:
+        try:
+            future.result()
+        except Exception as exc:  # pragma: no cover - exercised by integration failures.
+            _warn_async_video(logger, "Async video encoding failed: %s", exc)
+    executor = _async_video_executor
+    _async_video_executor = None
+    if executor is not None:
+        executor.shutdown(wait=False)
+
+
+def record_video(
+        snapshot_dir,
+        step_itr,
+        label,
+        trajectories,
+        n_cols=None,
+        skip_frames=1,
+        shape=(64, 64),
+        async_encode=False,
+        logger=None):
     renders = trajectories_to_video_tensor(trajectories, skip_frames=skip_frames, shape=shape)
     if renders.size == 0:
         return
+    if async_encode:
+        executor = _get_async_video_executor()
+        future = executor.submit(_save_video_async_job, snapshot_dir, step_itr, label, renders, n_cols)
+        _async_video_futures.append(future)
+        return
     save_video(snapshot_dir, step_itr, label, renders, n_cols=n_cols)
+
+
+atexit.register(flush_async_video_encoding)
 
 
 

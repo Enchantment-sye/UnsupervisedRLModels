@@ -92,61 +92,64 @@ class MetraTrainer:
             )
             return last_return
 
-        with utils.GlobalContext({'phase': 'train', 'policy': 'sampling'}):
-            self.logger.info('Obtaining samples...')
-            for epoch in tqdm(range(self.start_epoch, self.cfg.n_epochs)):
-                if self.cfg.cascade.use_cascade:
-                    if not self.auto_branch.enabled:
-                        self._try_grow_policy_stage(epoch)
-                    self._try_grow_skill_stage(epoch)
+        try:
+            with utils.GlobalContext({'phase': 'train', 'policy': 'sampling'}):
+                self.logger.info('Obtaining samples...')
+                for epoch in tqdm(range(self.start_epoch, self.cfg.n_epochs)):
+                    if self.cfg.cascade.use_cascade:
+                        if not self.auto_branch.enabled:
+                            self._try_grow_policy_stage(epoch)
+                        self._try_grow_skill_stage(epoch)
 
-                self.logger.info('epoch #%d | ' % epoch)
-                self._itr_start_time = time.time()
-                self.total_epoch = epoch
+                    self.logger.info('epoch #%d | ' % epoch)
+                    self._itr_start_time = time.time()
+                    self.total_epoch = epoch
 
-                self._set_models_mode('eval')
-                if self.cfg.stage == 'pre_training' and self.agent.traj_encoder is not None:
-                    self.agent.traj_encoder.eval()
+                    self._set_models_mode('eval')
+                    if self.cfg.stage == 'pre_training' and self.agent.traj_encoder is not None:
+                        self.agent.traj_encoder.eval()
 
-                if self.cfg.n_epochs_per_eval != 0 and (self.step_itr + 1) % self.cfg.n_epochs_per_eval == 0:
-                    self.task_adapter.evaluate(self.step_itr, self.total_epoch, self.writer)
-                    self.log_diagnostics()
+                    if self.cfg.n_epochs_per_eval != 0 and (self.step_itr + 1) % self.cfg.n_epochs_per_eval == 0:
+                        self.task_adapter.evaluate(self.step_itr, self.total_epoch, self.writer)
+                        self.log_diagnostics()
 
-                self._set_models_mode('train')
-                if self.cfg.stage == 'pre_training' and self.agent.traj_encoder is not None:
-                    self.agent.traj_encoder.train()
+                    self._set_models_mode('train')
+                    if self.cfg.stage == 'pre_training' and self.agent.traj_encoder is not None:
+                        self.agent.traj_encoder.train()
 
-                time_sampling = [0.0]
-                with MeasureAndAccTime(time_sampling):
-                    step_paths = self.task_adapter.get_train_trajectories(self.cfg.traj_batch_size)
-                sampling_breakdown = {}
-                consume_sampling_metrics = getattr(self.task_adapter, "consume_train_sampling_metrics", None)
-                if callable(consume_sampling_metrics):
-                    sampling_breakdown = consume_sampling_metrics() or {}
-                
-                self.total_env_steps += sum([len(path['dones']) for path in step_paths])
-                
-                last_return = self.train_once(
-                    step_paths,
-                    extra_scalar_metrics={
-                        'TimeSampling': time_sampling[0],
-                        **sampling_breakdown,
-                    },
-                )
+                    time_sampling = [0.0]
+                    with MeasureAndAccTime(time_sampling):
+                        step_paths = self.task_adapter.get_train_trajectories(self.cfg.traj_batch_size)
+                    sampling_breakdown = {}
+                    consume_sampling_metrics = getattr(self.task_adapter, "consume_train_sampling_metrics", None)
+                    if callable(consume_sampling_metrics):
+                        sampling_breakdown = consume_sampling_metrics() or {}
 
-                self.step_itr += 1
-                if self.cfg.cascade.use_cascade:
-                    self.auto_branch.maybe_handle_epoch_end(epoch, step_paths, self.step_itr)
+                    self.total_env_steps += sum([len(path['dones']) for path in step_paths])
 
-                # Saving
-                new_save = (self.cfg.n_epochs_per_save != 0 and self.step_itr % self.cfg.n_epochs_per_save == 0)
-                pt_save = (self.cfg.n_epochs_per_pt_save != 0 and self.step_itr % self.cfg.n_epochs_per_pt_save == 0)
-                if new_save or pt_save:
-                    self.save(epoch, new_save, pt_save)
+                    last_return = self.train_once(
+                        step_paths,
+                        extra_scalar_metrics={
+                            'TimeSampling': time_sampling[0],
+                            **sampling_breakdown,
+                        },
+                    )
 
-                # Logging
-                if self.step_itr % self.cfg.n_epochs_per_log == 0:
-                    self.log_diagnostics()
+                    self.step_itr += 1
+                    if self.cfg.cascade.use_cascade:
+                        self.auto_branch.maybe_handle_epoch_end(epoch, step_paths, self.step_itr)
+
+                    # Saving
+                    new_save = (self.cfg.n_epochs_per_save != 0 and self.step_itr % self.cfg.n_epochs_per_save == 0)
+                    pt_save = (self.cfg.n_epochs_per_pt_save != 0 and self.step_itr % self.cfg.n_epochs_per_pt_save == 0)
+                    if new_save or pt_save:
+                        self.save(epoch, new_save, pt_save)
+
+                    # Logging
+                    if self.step_itr % self.cfg.n_epochs_per_log == 0:
+                        self.log_diagnostics()
+        finally:
+            self.close()
 
         return last_return
 
@@ -192,11 +195,14 @@ class MetraTrainer:
         with MeasureAndAccTime(time_training):
             self.agent._update_replay_buffer(data)
             
+            if self.replay_buffer is None:
+                epoch_data = agent_utils.flatten_data(data, self.agent.device)
+                metrics.update(self.agent.update(epoch_data))
             # KME buffer check (logic specific to pre-training setup for KME)
             # This logic is tightly coupled with replay buffer and agent state.
             # Ideally should be in agent or adapter, but trainer manages loop.
             # I'll keep it here but note it's slightly coupled.
-            if self.replay_buffer.n_transitions_stored < self.cfg.sac_min_buffer_size:
+            elif self.replay_buffer.n_transitions_stored < self.cfg.sac_min_buffer_size:
                  if should_use_kme(self.cfg) and self.cfg.kernel_map:
                      self.agent.path_datas.append(data)
                  trained_this_epoch = False
@@ -212,11 +218,10 @@ class MetraTrainer:
                         for traj_data in self.agent.path_datas:
                             self.agent._update_replay_buffer(traj_data)
                         self.agent.path_datas = []
-                
-                epoch_data = agent_utils.flatten_data(data, self.agent.device)
-                metrics.update(self.agent.update(epoch_data))
+
+                metrics.update(self.agent.update(None))
             
-        if trained_this_epoch:
+        if trained_this_epoch and self.replay_buffer is not None:
             metrics.setdefault('ReplayNumTransitions', float(self.replay_buffer.n_transitions_stored))
         
         # Logging performance
@@ -351,6 +356,14 @@ class MetraTrainer:
         policy = self.agent.sac_trainer.skill_policy
         if mode == 'train': policy.train()
         else: policy.eval()
+
+    def close(self):
+        try:
+            utils.flush_async_video_encoding(logger=self.logger)
+        finally:
+            close_adapter = getattr(self.task_adapter, 'close', None)
+            if callable(close_adapter):
+                close_adapter()
 
     def log_diagnostics(self, pause_for_plot=False):
         total_time = (time.time() - self._start_time)

@@ -62,11 +62,12 @@ class SkillRolloutWorker:
             attr_dict[key] = functools.reduce(getattr, [self] + key.split('.'))
         return attr_dict
 
-    def start_rollout(self, env, policy, deterministic_policy=False):
+    def start_rollout(self, env, policy, deterministic_policy=False, reset_perturbation=None):
         """Begin a new rollout."""
         self._path_length = 0
         self._last_valid_video_frame = None
         self._pending_render_bootstrap = False
+        self._set_next_reset_perturbation(env, reset_perturbation)
         reset_started = time.perf_counter()
         timestep = env.reset()
         self._timing_totals["TimeSamplingEnv"] += (time.perf_counter() - reset_started)
@@ -404,6 +405,7 @@ class SkillRolloutWorker:
         deterministic_policy=False,
         state_record_pixeled=False,
         video_frame_source=None,
+        reset_perturbation=None,
     ):
         """Sample a single rollout of the agent in the environment.
         Params:
@@ -412,7 +414,12 @@ class SkillRolloutWorker:
             garage.TrajectoryBatch: The collected trajectory.
 
         """
-        self.start_rollout(env, policy, deterministic_policy=deterministic_policy)
+        self.start_rollout(
+            env,
+            policy,
+            deterministic_policy=deterministic_policy,
+            reset_perturbation=reset_perturbation,
+        )
         self._video_frame = self._bootstrap_video_frame(
             env,
             state_record_pixeled=state_record_pixeled,
@@ -427,3 +434,14 @@ class SkillRolloutWorker:
         ):
             pass
         return self.collect_rollout(env)
+
+    def _set_next_reset_perturbation(self, env, reset_perturbation):
+        if reset_perturbation is None:
+            return
+        seed, scale = reset_perturbation
+        if float(scale) <= 0.0:
+            return
+        setter = getattr(env, "set_next_reset_perturbation", None)
+        if not callable(setter):
+            raise AttributeError("Environment does not support set_next_reset_perturbation.")
+        setter(int(seed), float(scale))

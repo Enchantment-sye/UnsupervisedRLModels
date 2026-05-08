@@ -79,6 +79,8 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
         self.best_skill = None
         self.rollout_worker = None
         self._parallel_train_collector = None
+        self._generic_parallel_collector = None
+        self._kitchen_parallel_collector = None
         self._last_train_sampling_metrics = {}
         self.coverage_tracker = None
         self._structure_metrics_eval_count = 0
@@ -156,8 +158,10 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
             deterministic_policy,
             rollout_seed,
             state_record_pixeled=False,
-            video_frame_source=None):
+            video_frame_source=None,
+            reset_perturbations=None):
         extras = list(extras)
+        reset_perturbations = self._normalize_reset_perturbations(reset_perturbations, len(extras))
         if (
                 _task_requests_galaxea_sim(self.cfg)
                 and int(getattr(self.cfg, 'n_parallel', 1) or 1) > 1
@@ -170,6 +174,7 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
                     deterministic_policy=deterministic_policy,
                     state_record_pixeled=state_record_pixeled,
                     video_frame_source=video_frame_source,
+                    reset_perturbations=reset_perturbations,
                 )
                 collector.consume_timing_metrics()
                 if len(trajectories) == len(extras):
@@ -182,12 +187,54 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
             except Exception as exc:
                 self.logger.warning("Galaxea parallel eval/video rollout failed; falling back to serial: %s", exc)
 
+        if self._should_use_generic_parallel_sampler(for_eval=True, state_record_pixeled=state_record_pixeled):
+            try:
+                collector = self._get_generic_parallel_collector()
+                trajectories = collector.collect_fixed(
+                    self.agent.sac_trainer.skill_policy,
+                    extras=extras,
+                    deterministic_policy=deterministic_policy,
+                    state_record_pixeled=state_record_pixeled,
+                    video_frame_source=video_frame_source,
+                    reset_perturbations=reset_perturbations,
+                )
+                if len(trajectories) == len(extras):
+                    return trajectories
+                self.logger.warning(
+                    "Generic parallel eval/video returned %d/%d trajectories; falling back to serial rollout.",
+                    len(trajectories),
+                    len(extras),
+                )
+                self._discard_generic_parallel_collector()
+            except Exception as exc:
+                self._discard_generic_parallel_collector()
+                if not bool(getattr(self.cfg, 'parallel_sampler_fail_open', True)):
+                    raise
+                self.logger.warning("Generic parallel eval/video rollout failed; falling back to serial: %s", exc)
+
+        if self._should_use_kitchen_parallel_sampler(for_eval=True, state_record_pixeled=state_record_pixeled):
+            collector = self._get_kitchen_parallel_collector()
+            trajectories = collector.collect_fixed(
+                self.agent.sac_trainer.skill_policy,
+                extras=extras,
+                deterministic_policy=deterministic_policy,
+                state_record_pixeled=state_record_pixeled,
+                video_frame_source=video_frame_source,
+                reset_perturbations=reset_perturbations,
+            )
+            if len(trajectories) != len(extras):
+                raise RuntimeError(
+                    f"Kitchen parallel eval sampler returned {len(trajectories)}/{len(extras)} trajectories."
+                )
+            return trajectories
+
         return self._collect_policy_trajectories_serial(
             extras,
             deterministic_policy=deterministic_policy,
             rollout_seed=rollout_seed,
             state_record_pixeled=state_record_pixeled,
             video_frame_source=video_frame_source,
+            reset_perturbations=reset_perturbations,
         )
 
     def _collect_policy_trajectories_serial(
@@ -197,7 +244,9 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
             deterministic_policy,
             rollout_seed,
             state_record_pixeled=False,
-            video_frame_source=None):
+            video_frame_source=None,
+            reset_perturbations=None):
+        reset_perturbations = self._normalize_reset_perturbations(reset_perturbations, len(extras))
         rollout_worker = SkillRolloutWorker(
             rollout_seed,
             self.cfg.time_limit,
@@ -206,7 +255,7 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
             config=self.cfg,
         )
         batches = []
-        for extra in extras:
+        for idx, extra in enumerate(extras):
             batch = rollout_worker.rollout(
                 self.env,
                 self.agent.sac_trainer.skill_policy,
@@ -214,9 +263,21 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
                 deterministic_policy=deterministic_policy,
                 state_record_pixeled=state_record_pixeled,
                 video_frame_source=video_frame_source,
+                reset_perturbation=reset_perturbations[idx],
             )
             batches.append(batch)
         return TrajectoryBatch.concatenate(*batches).to_trajectory_list()
+
+    @staticmethod
+    def _normalize_reset_perturbations(reset_perturbations, expected_length):
+        if reset_perturbations is None:
+            return [None] * int(expected_length)
+        reset_perturbations = list(reset_perturbations)
+        if len(reset_perturbations) != int(expected_length):
+            raise ValueError(
+                f"Expected {expected_length} reset perturbations, got {len(reset_perturbations)}."
+            )
+        return reset_perturbations
 
     def build_auto_branch_probe_extras(self, num_episodes, branch_id):
         if not uses_skill_inputs(self.cfg):
@@ -256,6 +317,43 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
             )
             self._last_train_sampling_metrics = collector.consume_timing_metrics()
             return trajectories
+
+        if self._should_use_kitchen_parallel_sampler(for_eval=False, state_record_pixeled=False):
+            collector = self._get_kitchen_parallel_collector()
+            trajectories = collector.collect(
+                self.agent.sac_trainer.skill_policy,
+                target_num_trajectories=batch_size,
+                sample_extra_fn=self._sample_single_train_extra,
+            )
+            self._last_train_sampling_metrics = collector.consume_timing_metrics()
+            if len(trajectories) != batch_size:
+                raise RuntimeError(
+                    f"Kitchen parallel train sampler returned {len(trajectories)}/{batch_size} trajectories."
+                )
+            return trajectories
+
+        if self._should_use_generic_parallel_sampler(for_eval=False, state_record_pixeled=False):
+            try:
+                collector = self._get_generic_parallel_collector()
+                trajectories = collector.collect(
+                    self.agent.sac_trainer.skill_policy,
+                    target_num_trajectories=batch_size,
+                    sample_extra_fn=self._sample_single_train_extra,
+                )
+                self._last_train_sampling_metrics = collector.consume_timing_metrics()
+                if len(trajectories) == batch_size:
+                    return trajectories
+                self.logger.warning(
+                    "Generic parallel train sampler returned %d/%d trajectories; falling back to serial rollout.",
+                    len(trajectories),
+                    batch_size,
+                )
+                self._discard_generic_parallel_collector()
+            except Exception as exc:
+                self._discard_generic_parallel_collector()
+                if not bool(getattr(self.cfg, 'parallel_sampler_fail_open', True)):
+                    raise
+                self.logger.warning("Generic parallel train sampler failed; falling back to serial: %s", exc)
 
         if self.rollout_worker is None:
             self.rollout_worker = SkillRolloutWorker(
@@ -299,7 +397,8 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
 
     def _get_train_trajectories_kwargs(self, batch_size):
         if not uses_skill_inputs(self.cfg):
-            self.rollout_worker._cur_extra_keys = []
+            if self.rollout_worker is not None:
+                self.rollout_worker._cur_extra_keys = []
             return {}
 
         if is_finetune_stage(self.cfg):
@@ -308,7 +407,8 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
             extras = [{'skill': np.asarray(self.best_skill, dtype=np.float32)} for _ in range(batch_size)]
             return dict(extras=extras)
 
-        self.rollout_worker._cur_extra_keys = ['skill']
+        if self.rollout_worker is not None:
+            self.rollout_worker._cur_extra_keys = ['skill']
 
         skills = self.sample_skills(batch_size)
         extras = self.build_skill_extras(skills)
@@ -351,6 +451,82 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
             num_envs=int(getattr(self.cfg, 'n_parallel', 1) or 1),
         )
         return self._parallel_train_collector
+
+    def _get_generic_parallel_collector(self):
+        if self._generic_parallel_collector is not None:
+            return self._generic_parallel_collector
+
+        from envs.generic_parallel import GenericProcessTrajectoryCollector
+
+        self._generic_parallel_collector = GenericProcessTrajectoryCollector(
+            self.cfg,
+            num_workers=self._generic_parallel_num_workers(),
+        )
+        return self._generic_parallel_collector
+
+    def _get_kitchen_parallel_collector(self):
+        if self._kitchen_parallel_collector is not None:
+            return self._kitchen_parallel_collector
+
+        from envs.kitchen_parallel import KitchenProcessTrajectoryCollector
+
+        self._kitchen_parallel_collector = KitchenProcessTrajectoryCollector(
+            self.cfg,
+            num_workers=self._generic_parallel_num_workers(),
+        )
+        return self._kitchen_parallel_collector
+
+    def _discard_generic_parallel_collector(self):
+        collector = self._generic_parallel_collector
+        self._generic_parallel_collector = None
+        close = getattr(collector, 'close', None)
+        if callable(close):
+            close()
+
+    def _generic_parallel_num_workers(self):
+        configured = int(getattr(self.cfg, 'parallel_sampler_num_workers', 0) or 0)
+        if configured > 0:
+            return configured
+        return int(getattr(self.cfg, 'n_parallel', 1) or 1)
+
+    def _should_use_generic_parallel_sampler(self, *, for_eval: bool, state_record_pixeled: bool):
+        if should_use_isaaclab_backend(self.cfg) or _task_requests_galaxea_sim(self.cfg):
+            return False
+        if getattr(self.cfg, 'task', '') in self._OFFICIAL_KITCHEN_TASKS:
+            return False
+        if bool(getattr(getattr(self.cfg, 'safety', None), 'enabled', 0)):
+            return False
+        if self._generic_parallel_num_workers() <= 1:
+            return False
+        if for_eval:
+            if not bool(getattr(self.cfg, 'eval_parallel_sampler_enabled', False)):
+                return False
+            if state_record_pixeled and not bool(getattr(self.cfg, 'eval_video_parallel_sampler_enabled', True)):
+                return False
+            return True
+        return bool(getattr(self.cfg, 'parallel_sampler_enabled', False))
+
+    def _should_use_kitchen_parallel_sampler(self, *, for_eval: bool, state_record_pixeled: bool):
+        if getattr(self.cfg, 'task', '') not in self._OFFICIAL_KITCHEN_TASKS:
+            return False
+        if self._generic_parallel_num_workers() <= 1:
+            return False
+        if for_eval:
+            if not bool(getattr(self.cfg, 'eval_parallel_sampler_enabled', False)):
+                return False
+            if state_record_pixeled and not bool(getattr(self.cfg, 'eval_video_parallel_sampler_enabled', True)):
+                return False
+            return True
+        return bool(getattr(self.cfg, 'parallel_sampler_enabled', False))
+
+    def close(self):
+        for collector in (
+                self._parallel_train_collector,
+                self._generic_parallel_collector,
+                self._kitchen_parallel_collector):
+            close = getattr(collector, 'close', None)
+            if callable(close):
+                close()
 
     def find_best_skill(self):
         if not uses_skill_inputs(self.cfg):
@@ -500,12 +676,12 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
                     )
                 video_trajectories = self.collect_policy_trajectories(
                     video_extras,
-                    deterministic_policy=False,
+                    deterministic_policy=True,
                     rollout_seed=self.cfg.seed + 100 + total_epoch,
                     state_record_pixeled=True,
                     video_frame_source=video_frame_source,
                 )
-                video_policy_mode = 'stochastic'
+                video_policy_mode = 'deterministic'
 
             if self.cfg.eval_record_video:
                 utils.record_video(
@@ -515,6 +691,8 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
                     video_trajectories,
                     skip_frames=self.cfg.video_skip_frames,
                     shape=(self.cfg.render_size, self.cfg.render_size),
+                    async_encode=bool(getattr(self.cfg, 'async_video_encoding', False)),
+                    logger=self.logger,
                 )
 
             if motion_analysis_enabled:
@@ -608,7 +786,15 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
         }
         policy_mode = getattr(self.cfg, 'eval_structure_metrics_policy_mode', 'deterministic')
         rollouts_per_skill = int(getattr(self.cfg, 'eval_structure_metrics_rollouts_per_skill', 3))
-        if bool(getattr(self.cfg, 'eval_structure_metrics_use_video_trajectories', True)):
+        reset_perturb_scale = float(getattr(self.cfg, 'eval_structure_metrics_reset_perturb_scale', 0.0))
+        source_metrics['StructureMetricsResetPerturbScale'] = reset_perturb_scale
+        source_metrics['StructureMetricsResetPerturbedRollouts'] = 0.0
+        if reset_perturb_scale > 0.0:
+            source_metrics['StructureMetricsVideoSkipReasonCode'] = float(SkipReason.VIDEO_TRAJECTORIES_NOT_SUITABLE)
+        if (
+                reset_perturb_scale <= 0.0
+                and bool(getattr(self.cfg, 'eval_structure_metrics_use_video_trajectories', True))
+        ):
             suitable, reason, inferred_skill_ids = video_trajectories_are_suitable(
                 video_trajectories,
                 min_trajs_per_cluster=rollouts_per_skill,
@@ -636,15 +822,36 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
             return [], option_bundle.options, option_bundle.skill_ids, source_metrics
 
         extras = self.build_skill_extras(option_bundle.options)
+        reset_perturbations = self._build_structure_reset_perturbations(
+            len(extras),
+            total_epoch=total_epoch,
+            scale=reset_perturb_scale,
+        )
         structure_trajectories = self.collect_policy_trajectories(
             extras,
             deterministic_policy=(policy_mode == 'deterministic'),
             rollout_seed=int(getattr(self.cfg, 'seed', 0)) + 5000 + int(total_epoch),
             state_record_pixeled=False,
+            reset_perturbations=reset_perturbations,
         )
         source_metrics['StructureMetricsUsedExtraRollouts'] = 1.0
+        source_metrics['StructureMetricsResetPerturbedRollouts'] = float(
+            any(perturbation is not None for perturbation in reset_perturbations)
+        )
         source_metrics['StructureMetricsSubsampled'] = float(option_bundle.subsampled)
         return structure_trajectories, option_bundle.options, option_bundle.skill_ids, source_metrics
+
+    def _build_structure_reset_perturbations(self, num_rollouts, *, total_epoch, scale):
+        scale = float(scale)
+        if scale <= 0.0:
+            return [None] * int(num_rollouts)
+        base_seed = (
+            int(getattr(self.cfg, 'seed', 0))
+            + 9000003
+            + int(total_epoch) * 1009
+            + int(getattr(self.cfg, 'eval_structure_metrics_anchor_seed', 0)) * 9176
+        )
+        return [(base_seed + idx, scale) for idx in range(int(num_rollouts))]
 
     def _write_structure_metrics(self, writer, step_itr, metrics):
         # This hook only covers the task_adapter training eval path. The legacy

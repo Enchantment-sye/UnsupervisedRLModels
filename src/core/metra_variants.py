@@ -205,7 +205,7 @@ class BaseVariant:
                 skills = batch.get('skills')
                 if skills is None:
                      # Should not happen in training usually
-                     skills = torch.zeros_like(batch['cur_phi']) 
+                     skills = torch.zeros_like(batch['cur_phi'])
                 elif skills.dim() > 2:
                     skills = skills.reshape(skills.shape[0], -1)
 

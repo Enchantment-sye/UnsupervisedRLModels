@@ -20,6 +20,7 @@ class KitchenEnv(BenchEnv):
                 distance=1.86, lookat=[-0.3, .5, 2.], azimuth=90, elevation=-60)
 
         self.rendered_goal = False
+        self._next_reset_perturbation = None
         self._env.reset()
         self.init_qpos = self._env.sim.data.qpos.copy()
         self.goal_idx = 0
@@ -34,6 +35,38 @@ class KitchenEnv(BenchEnv):
 
     def get_goals(self):
         return self.goals
+
+    def set_next_reset_perturbation(self, seed, scale):
+        scale = float(scale)
+        if scale <= 0.0:
+            self._next_reset_perturbation = None
+            return False
+        self._next_reset_perturbation = (int(seed), scale)
+        return True
+
+    def _apply_next_reset_perturbation(self):
+        perturbation = self._next_reset_perturbation
+        self._next_reset_perturbation = None
+        if perturbation is None:
+            return False
+        seed, scale = perturbation
+        rng = np.random.RandomState(int(seed) % (2**32 - 1))
+        qpos = self._env.sim.data.qpos.copy()
+        qvel = self._env.sim.data.qvel.copy()
+        robot_qpos_dim = min(9, qpos.shape[0])
+        qpos[:robot_qpos_dim] += rng.normal(
+            loc=0.0,
+            scale=float(scale),
+            size=robot_qpos_dim,
+        )
+        self._set_backend_state(qpos, qvel)
+        return True
+
+    def _set_backend_state(self, qpos, qvel):
+        sim = self._env.sim
+        sim.data.qpos[:] = qpos
+        sim.data.qvel[:] = qvel
+        sim.forward()
 
     def _get_obs(self, state):
         image = self._env.render('rgb_array', width=self._env.imwidth, height =self._env.imheight)
@@ -114,11 +147,11 @@ class KitchenEnv(BenchEnv):
         goal_idx = self.goal if goal_idx is None else goal_idx
         qpos[self.obs_element_indices[goal_idx]] = self.obs_element_goals[goal_idx]
 
-        self._env.set_state(qpos, np.zeros(len(self._env.init_qvel)))
+        self._set_backend_state(qpos, np.zeros(len(self._env.init_qvel)))
 
         goal_obs = self._env.render('rgb_array', width=self._env.imwidth, height=self._env.imheight)
 
-        self._env.set_state(backup_qpos, backup_qvel)
+        self._set_backend_state(backup_qpos, backup_qvel)
 
         self.rendered_goal_obj = goal_obs
         return goal_obs
@@ -127,6 +160,8 @@ class KitchenEnv(BenchEnv):
 
         with self.LOCK:
             state = self._env.reset()
+            if self._apply_next_reset_perturbation() and hasattr(self._env, "_get_obs"):
+                state = self._env._get_obs()
         if not self.use_goal_idx:
             self.goal_idx = np.random.randint(len(self.goals))
         self.goal = self.goals[self.goal_idx]

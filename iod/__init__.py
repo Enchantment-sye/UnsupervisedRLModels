@@ -1,2 +1,1 @@
 """IOD compatibility utilities."""
-

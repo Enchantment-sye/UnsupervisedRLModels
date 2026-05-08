@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import time
 from collections import defaultdict
 from utils import utils
 
@@ -38,6 +39,74 @@ def numpy_batch_to_torch(value, device, *, dtype=torch.float32, non_blocking=Fal
         except RuntimeError:
             pass
     return tensor.to(device=device, dtype=dtype, non_blocking=non_blocking)
+
+
+class ReplayTensorStager:
+    """Reusable pinned-memory staging buffers for replay batches.
+
+    This preserves replay sampling order and values; it only changes how the
+    already-sampled NumPy arrays are transferred to the training device.
+    """
+
+    def __init__(self, *, pin_memory=True):
+        self.pin_memory = bool(pin_memory)
+        self._buffers = {}
+        self._pin_memory_available = True
+
+    def to_torch(self, key, value, device, *, dtype=torch.float32):
+        device = torch.device(device)
+        started = time.perf_counter()
+
+        if torch.is_tensor(value):
+            stage_sec = time.perf_counter() - started
+            h2d_started = time.perf_counter()
+            tensor = value.to(
+                device=device,
+                dtype=dtype,
+                non_blocking=self._can_non_blocking(device),
+            )
+            return tensor, stage_sec, time.perf_counter() - h2d_started
+
+        source = torch.from_numpy(np.asarray(value))
+        if source.dtype != dtype:
+            source = source.to(dtype=dtype)
+
+        if not self._should_use_pinned_staging(device):
+            stage_sec = time.perf_counter() - started
+            h2d_started = time.perf_counter()
+            tensor = source.to(device=device, dtype=dtype, non_blocking=False)
+            return tensor, stage_sec, time.perf_counter() - h2d_started
+
+        buffer_key = (key, tuple(source.shape), dtype)
+        try:
+            buffer = self._buffers.get(buffer_key)
+            if buffer is None:
+                buffer = torch.empty(source.shape, dtype=dtype, pin_memory=True)
+                self._buffers[buffer_key] = buffer
+            buffer.copy_(source, non_blocking=False)
+        except RuntimeError:
+            self._pin_memory_available = False
+            stage_sec = time.perf_counter() - started
+            h2d_started = time.perf_counter()
+            tensor = source.to(device=device, dtype=dtype, non_blocking=False)
+            return tensor, stage_sec, time.perf_counter() - h2d_started
+
+        stage_sec = time.perf_counter() - started
+        h2d_started = time.perf_counter()
+        tensor = buffer.to(device=device, non_blocking=True)
+        return tensor, stage_sec, time.perf_counter() - h2d_started
+
+    def _should_use_pinned_staging(self, device):
+        return (
+            self.pin_memory
+            and self._pin_memory_available
+            and device.type == "cuda"
+            and torch.cuda.is_available()
+        )
+
+    @staticmethod
+    def _can_non_blocking(device):
+        return device.type == "cuda" and torch.cuda.is_available()
 
 def process_samples(paths, discount):
     data = defaultdict(list)

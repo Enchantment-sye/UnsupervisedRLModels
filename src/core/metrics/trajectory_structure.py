@@ -307,11 +307,13 @@ def compute_temporal_structure_metrics(
         device="cpu",
         knn_k: int = 8,
         soft_dtw_gamma: float = 1.0,
-        deterministic_policy: bool = True):
+        deterministic_policy: bool = True,
+        degenerate_policy: str = "skip"):
     del device
     result = {
         "StructureMetricsTemporalSkipped": 1.0,
         "StructureMetricsTemporalSkipReasonCode": float(SkipReason.OK),
+        "StructureMetricsTemporalDegenerateWarnCompute": 0.0,
     }
     if len(traj_state_sequences) < 2:
         result["StructureMetricsTemporalSkipReasonCode"] = float(SkipReason.MISSING_EVAL_PATHS)
@@ -330,7 +332,10 @@ def compute_temporal_structure_metrics(
     dbi = None
     dbi_reason = int(grouping.skip_reason_code)
     degenerate = _has_degenerate_repeats(traj_state_sequences, grouping.valid_groups)
-    if deterministic_policy and degenerate:
+    allow_degenerate_compute = str(degenerate_policy) == "warn_compute"
+    if deterministic_policy and degenerate and allow_degenerate_compute:
+        result["StructureMetricsTemporalDegenerateWarnCompute"] = 1.0
+    if deterministic_policy and degenerate and not allow_degenerate_compute:
         dbi_reason = int(SkipReason.DETERMINISTIC_REPEATS_DEGENERATE)
     elif not grouping.skipped:
         trajectory_distances = _trajectory_soft_dtw_distance_matrix(
@@ -369,12 +374,14 @@ def compute_ikse_structure_metrics(
         device="cpu",
         anchor_seed: int = 0,
         deterministic_policy: bool = True,
+        degenerate_policy: str = "skip",
         ensemble_size: int = 100,
         subsample_size: int | None = None):
     del device
     result = {
         "StructureMetricsIKSkipped": 1.0,
         "StructureMetricsIKSkipReasonCode": float(SkipReason.OK),
+        "StructureMetricsIKDegenerateWarnCompute": 0.0,
     }
     point_states = np.asarray(point_states, dtype=np.float32)
     if point_states.ndim != 2 or point_states.shape[0] < 2:
@@ -398,7 +405,10 @@ def compute_ikse_structure_metrics(
     dbi = None
     dbi_reason = int(grouping.skip_reason_code)
     degenerate = _has_degenerate_repeats(traj_state_sequences, grouping.valid_groups)
-    if deterministic_policy and degenerate:
+    allow_degenerate_compute = str(degenerate_policy) == "warn_compute"
+    if deterministic_policy and degenerate and allow_degenerate_compute:
+        result["StructureMetricsIKDegenerateWarnCompute"] = 1.0
+    if deterministic_policy and degenerate and not allow_degenerate_compute:
         dbi_reason = int(SkipReason.DETERMINISTIC_REPEATS_DEGENERATE)
     elif not grouping.skipped:
         try:
@@ -461,6 +471,7 @@ def compute_training_eval_structure_metrics(
     anchor_seed = int(getattr(cfg, "eval_structure_metrics_anchor_seed", 0))
     rollouts_per_skill = int(getattr(cfg, "eval_structure_metrics_rollouts_per_skill", 3))
     deterministic_policy = str(getattr(cfg, "eval_structure_metrics_policy_mode", "deterministic")) == "deterministic"
+    degenerate_policy = str(getattr(cfg, "eval_structure_metrics_degenerate_policy", "skip"))
 
     state_result = extract_structure_state_sequences(
         trajectories,
@@ -486,8 +497,10 @@ def compute_training_eval_structure_metrics(
     metrics["StructureMetricsNumSkills"] = float(grouping.num_skills)
     metrics["StructureMetricsNumTrajsPerSkillMean"] = float(grouping.num_trajs_per_skill_mean)
     metrics["StructureMetricsDBINumTrajs"] = float(grouping.dbi_num_trajs)
-    metrics["StructureMetricsDegenerateRepeats"] = float(
-        _has_degenerate_repeats(state_result.traj_state_sequences, grouping.valid_groups)
+    degenerate_repeats = _has_degenerate_repeats(state_result.traj_state_sequences, grouping.valid_groups)
+    metrics["StructureMetricsDegenerateRepeats"] = float(degenerate_repeats)
+    metrics["StructureMetricsDegeneratePolicyWarnCompute"] = float(
+        deterministic_policy and degenerate_repeats and degenerate_policy == "warn_compute"
     )
 
     if "temporal" in requested_backends:
@@ -499,6 +512,7 @@ def compute_training_eval_structure_metrics(
             knn_k=int(getattr(cfg, "temporal_graph_knn_k", 8)),
             soft_dtw_gamma=float(getattr(cfg, "soft_dtw_gamma", 1.0)),
             deterministic_policy=deterministic_policy,
+            degenerate_policy=degenerate_policy,
         )
         metrics.update(temporal_metrics)
     if "ikse" in requested_backends:
@@ -510,6 +524,7 @@ def compute_training_eval_structure_metrics(
             device="cpu",
             anchor_seed=anchor_seed,
             deterministic_policy=deterministic_policy,
+            degenerate_policy=degenerate_policy,
         )
         metrics.update(ik_metrics)
 
@@ -599,6 +614,7 @@ def _base_metric_dict(backends: Iterable[str]) -> dict[str, float]:
         "StructureMetricsSkipped": 0.0,
         "StructureMetricsSkipReasonCode": float(SkipReason.OK),
         "StructureMetricsDegenerateRepeats": 0.0,
+        "StructureMetricsDegeneratePolicyWarnCompute": 0.0,
     }
 
 

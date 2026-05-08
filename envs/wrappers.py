@@ -70,7 +70,7 @@ class GymWrapper:
         try:
             return getattr(self._env, name)
         except AttributeError:
-            raise ValueError(name)
+            raise AttributeError(name)
 
     @property
     def obs_space(self):
@@ -144,7 +144,7 @@ class LLMActionWrapper:
         try:
             return getattr(self._env, name)
         except AttributeError:
-            raise ValueError(name)
+            raise AttributeError(name)
     
     def step(self, action):
         obs = self._env.step(action)
@@ -241,7 +241,7 @@ class ViClipWrapper:
         try:
             return getattr(self._env, name)
         except AttributeError:
-            raise ValueError(name)
+            raise AttributeError(name)
 
     def hd_render(self, obs):
         if not self.hd_rendering:
@@ -530,7 +530,7 @@ class OneHotAction:
         try:
             return getattr(self._env, name)
         except AttributeError:
-            raise ValueError(name)
+            raise AttributeError(name)
 
     @property
     def obs_space(self):
@@ -583,7 +583,7 @@ class MultiDiscreteAction:
         try:
             return getattr(self._env, name)
         except AttributeError:
-            raise ValueError(name)
+            raise AttributeError(name)
 
     @property
     def obs_space(self):
@@ -642,7 +642,7 @@ class ResizeImage:
         try:
             return getattr(self._env, name)
         except AttributeError:
-            raise ValueError(name)
+            raise AttributeError(name)
 
     @property
     def obs_space(self):
@@ -695,7 +695,7 @@ class RenderImage:
         try:
             return getattr(self._env, name)
         except AttributeError:
-            raise ValueError(name)
+            raise AttributeError(name)
 
     @property
     def obs_space(self):
@@ -738,7 +738,7 @@ class FrameStack:
         try:
             return getattr(self._env, name)
         except AttributeError:
-            raise ValueError(name)
+            raise AttributeError(name)
 
     @property
     def obs_space(self):
@@ -780,9 +780,27 @@ class FrameStack:
         else:
             return np.concatenate(list(self._frames), axis=-1)
 
+def _try_cloudpickle_dump(constructor):
+    if not _cloudpickle_can_roundtrip_code_objects():
+        return None
+    try:
+        return cloudpickle.dumps(constructor)
+    except Exception:
+        return None
+
+
+def _cloudpickle_can_roundtrip_code_objects():
+    def _probe():
+        return None
+
+    try:
+        cloudpickle.loads(cloudpickle.dumps(_probe))()
+    except Exception:
+        return False
+    return True
+
 
 class Async:
-
     # Message types for communication via the pipe.
     _ACCESS = 1
     _CALL = 2
@@ -791,11 +809,24 @@ class Async:
     _EXCEPTION = 5
 
     def __init__(self, constructor, strategy="thread"):
-        self._pickled_ctor = cloudpickle.dumps(constructor)
+        self._ctor = constructor
+        self._pickled_ctor = None
         if strategy == "process":
             import multiprocessing as mp
 
-            context = mp.get_context("spawn")
+            pickled_ctor = _try_cloudpickle_dump(constructor)
+            if pickled_ctor is not None:
+                context = mp.get_context("spawn")
+                self._ctor = None
+                self._pickled_ctor = pickled_ctor
+            else:
+                try:
+                    context = mp.get_context("fork")
+                except ValueError as exc:  # pragma: no cover - non-POSIX fallback.
+                    raise RuntimeError(
+                        "Process Async requires a cloudpickle version compatible "
+                        "with this Python runtime, or a platform with fork support."
+                    ) from exc
         elif strategy == "thread":
             import multiprocessing.dummy as context
         else:
@@ -867,7 +898,9 @@ class Async:
 
     def _worker(self, conn):
         try:
-            ctor = cloudpickle.loads(self._pickled_ctor)
+            ctor = self._ctor
+            if ctor is None:
+                ctor = cloudpickle.loads(self._pickled_ctor)
             env = ctor()
             conn.send((self._RESULT, None))  # Ready.
             while True:
