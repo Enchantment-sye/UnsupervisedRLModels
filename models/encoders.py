@@ -47,6 +47,9 @@ class BaseHuggingFaceEncoder(torch.nn.Module):
                 self._resize_h, self._resize_w = s, s
 
         self.model = self._load_model(model_dir, use_safetensors).to(self.device)
+        # Move this module's non-parameter buffers (normalization mean/std) with
+        # the HuggingFace model. Moving only self.model leaves buffers on CPU.
+        self.to(self.device)
 
         # finetune flag must exist (important)
         self.finetune = bool(finetune)
@@ -186,8 +189,11 @@ class BaseHuggingFaceEncoder(torch.nn.Module):
             if x.shape[-2] != self._resize_h or x.shape[-1] != self._resize_w:
                 x = F.interpolate(x, size=(self._resize_h, self._resize_w), mode="bilinear", align_corners=False)
 
-        # Normalize
-        x = (x - self._img_mean) / (self._img_std + 1e-8)
+        # Normalize. Keep buffers defensively aligned with the current input in
+        # case a wrapper moved only the HF model or restored buffers on CPU.
+        mean = self._img_mean.to(device=x.device, dtype=x.dtype)
+        std = self._img_std.to(device=x.device, dtype=x.dtype)
+        x = (x - mean) / (std + 1e-8)
 
         # Match model dtype (important for finetune + mixed precision)
         model_dtype = next(self.model.parameters()).dtype
