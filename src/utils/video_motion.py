@@ -19,8 +19,14 @@ def infer_expected_video_count(discrete, dim_skill, num_video_repeats):
     repeats = max(1, int(num_video_repeats))
     if int(discrete):
         return max(1, int(dim_skill)) * repeats
-    base_count = 9 if int(dim_skill) == 2 else 16
-    return base_count * repeats
+    return 9 * repeats
+
+
+def infer_skill_video_grid_cols(discrete, dim_skill, num_video_repeats, n_cols=None):
+    expected_videos = infer_expected_video_count(discrete, dim_skill, num_video_repeats)
+    if n_cols is not None or int(discrete):
+        return utils.infer_video_grid_cols(expected_videos, n_cols=n_cols)
+    return 3 * max(1, int(num_video_repeats))
 
 
 
@@ -59,7 +65,7 @@ def split_montage_frames(frames, discrete, dim_skill, num_video_repeats, n_cols=
         return []
 
     expected_videos = infer_expected_video_count(discrete, dim_skill, num_video_repeats)
-    n_cols = utils.infer_video_grid_cols(expected_videos, n_cols=n_cols)
+    n_cols = infer_skill_video_grid_cols(discrete, dim_skill, num_video_repeats, n_cols=n_cols)
     n_rows = int(np.ceil(expected_videos / float(n_cols)))
     frame_h, frame_w = frames.shape[1:3]
     tile_h = frame_h // n_rows

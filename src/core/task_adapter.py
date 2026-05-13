@@ -689,6 +689,7 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
                     step_itr,
                     'Video_RandomZ',
                     video_trajectories,
+                    n_cols=self._get_video_n_cols(),
                     skip_frames=self.cfg.video_skip_frames,
                     shape=(self.cfg.render_size, self.cfg.render_size),
                     async_encode=bool(getattr(self.cfg, 'async_video_encoding', False)),
@@ -1043,8 +1044,18 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
                     video_skills.append([radius * np.cos(angle * np.pi / 4), radius * np.sin(angle * np.pi / 4)])
                 video_skills = np.array(video_skills)
             else:
-                video_skills = np.random.randn(16, self.cfg.dim_skill)
+                video_skills = np.random.randn(9, self.cfg.dim_skill)
                 if self.cfg.unit_length:
                     video_skills = video_skills / np.linalg.norm(video_skills, axis=1, keepdims=True)
         
         return video_skills.repeat(self.cfg.num_video_repeats, axis=0)
+
+    def _get_video_n_cols(self):
+        if (
+            uses_skill_inputs(self.cfg)
+            and not self.cfg.discrete
+            and not self.cfg.use_hierarchical_skill
+            and not is_finetune_stage(self.cfg)
+        ):
+            return 3 * max(1, int(self.cfg.num_video_repeats))
+        return None
