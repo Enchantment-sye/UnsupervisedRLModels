@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.abspath("src"))
 
 from core import task_adapter as task_adapter_module
 from core.task_adapter import SkillDiscoveryTaskAdapter
+from utils import video_motion
 
 
 class _Writer:
@@ -176,6 +177,24 @@ def test_video_eval_uses_deterministic_policy(monkeypatch):
     assert calls
     assert calls[-1]["deterministic_policy"] is True
     assert calls[-1]["state_record_pixeled"] is True
+
+
+def test_continuous_video_layout_uses_nine_skills_and_six_columns():
+    adapter = _adapter(False)
+    adapter.cfg.discrete = False
+    adapter.cfg.dim_skill = 4
+    adapter.cfg.unit_length = True
+    adapter.cfg.num_video_repeats = 2
+
+    np.random.seed(123)
+    skills = adapter._get_video_skills()
+
+    assert skills.shape == (18, 4)
+    assert np.allclose(skills[0], skills[1])
+    assert np.allclose(np.linalg.norm(skills[::2], axis=1), 1.0)
+    assert adapter._get_video_n_cols() == 6
+    assert video_motion.infer_expected_video_count(False, 4, 2) == 18
+    assert video_motion.infer_skill_video_grid_cols(False, 4, 2) == 6
 
 
 def test_structure_metrics_perturbation_forces_extra_deterministic_rollouts(monkeypatch):
