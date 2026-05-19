@@ -36,6 +36,12 @@ def test_queue_keeps_only_recent_trajectories():
     ]
 
 
+def test_default_queue_size_is_100000_train_trajectories():
+    tracker = CoverageTracker("ant")
+
+    assert tracker.queue_size == 100000
+
+
 def test_total_coverage_does_not_decrease_when_queue_evicts():
     tracker = CoverageTracker("ant", queue_size=3)
 
@@ -87,6 +93,20 @@ def test_missing_coordinates_do_not_crash_and_report_missing_info_once():
     assert len(caught) == 1
 
 
+def test_halfcheetah_coverage_uses_x_bins_only():
+    tracker = CoverageTracker("halfcheetah", queue_size=3)
+
+    path = {
+        "env_infos": {
+            "coordinates": np.asarray([[0.2, 0.2], [0.2, 7.7]], dtype=np.float32),
+            "next_coordinates": np.asarray([[0.2, 7.7], [1.2, 9.2]], dtype=np.float32),
+        }
+    }
+    metrics = tracker.compute_policy_metrics([path])
+
+    assert metrics["PolicyStateCoverageXYBins"] == 2
+
+
 def test_missing_train_coordinates_mark_queue_and_total_metrics():
     tracker = CoverageTracker("ant", queue_size=3)
 
@@ -102,3 +122,18 @@ def test_missing_train_coordinates_mark_queue_and_total_metrics():
     assert total_metrics["TotalStateCoverageXYBins"] == 0
     assert total_metrics["MissingCoverageInfo"] == 1
     assert len(caught) == 1
+
+
+def test_ogbench_scene_coverage_tracker_is_noop():
+    tracker = CoverageTracker("ogbench_scene", queue_size=3)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        tracker.update_train_paths([{"env_infos": {}}])
+        policy_metrics = tracker.compute_policy_metrics([{"env_infos": {}}])
+
+    assert policy_metrics == {}
+    assert tracker.compute_queue_metrics() == {}
+    assert tracker.compute_total_metrics() == {}
+    assert list(tracker.queue) == []
+    assert len(caught) == 0

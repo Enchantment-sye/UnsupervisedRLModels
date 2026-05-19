@@ -27,6 +27,9 @@ class EnvConfig:
     galaxea_sim_video_source: str = 'observation'
     galaxea_sim_video_view_preset: str = 'default'
     galaxea_sim_controller_type: str = 'bimanual_joint_position'
+    ogbench_video_source: str = 'blog'
+    ogbench_video_render_size: int = 256
+    ogbench_video_opaque_arm: int = 1
 
 @dataclass
 class LogConfig:
@@ -44,6 +47,8 @@ class LogConfig:
     eval_record_video: int = 1
     video_skip_frames: int = 1
     eval_plot_axis: Optional[List[float]] = None
+    eval_skill_xy_plot: bool = True
+    eval_skill_xy_plot_rollouts_per_skill: int = 3
     num_random_trajectories: int = 48
     ikse: bool = False
     metric_num_sampled_points: int = 10
@@ -131,6 +136,8 @@ class MotionAnalysisConfig:
     fixed_tau_p: float = 0.04
     smooth_window: int = 5
     large_motion_threshold: float = 2.0
+    video_pixel_knn_k: int = 8
+    video_pixel_max_points: int = 2048
     eps: float = 1e-8
 
 @dataclass
@@ -246,6 +253,7 @@ class TrainConfig:
     skill_policy_path: str = ''
     parallel_sampler_enabled: bool = True
     parallel_sampler_num_workers: int = 0
+    parallel_sampler_start_method: str = 'auto'
     parallel_sampler_fail_open: bool = True
     eval_parallel_sampler_enabled: bool = True
     eval_video_parallel_sampler_enabled: bool = True

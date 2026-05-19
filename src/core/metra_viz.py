@@ -310,6 +310,101 @@ def _metric_score(entropy_value, dbi_value, *, eps: float = 1e-8):
     return float(entropy_value) / (float(dbi_value) + eps)
 
 
+def extract_xy_trajectory(trajectory):
+    env_infos = trajectory.get('env_infos', {}) or {}
+    coordinates = env_infos.get('coordinates')
+    next_coordinates = env_infos.get('next_coordinates')
+    if coordinates is None or next_coordinates is None:
+        return None
+
+    coordinates = np.asarray(coordinates, dtype=np.float32)
+    next_coordinates = np.asarray(next_coordinates, dtype=np.float32)
+    if coordinates.ndim == 1:
+        coordinates = coordinates.reshape(1, -1)
+    if next_coordinates.ndim == 1:
+        next_coordinates = next_coordinates.reshape(1, -1)
+    if coordinates.ndim != 2 or coordinates.shape[0] == 0 or coordinates.shape[1] < 2:
+        return None
+    if next_coordinates.ndim != 2 or next_coordinates.shape[0] == 0 or next_coordinates.shape[1] < 2:
+        return None
+    return np.concatenate([coordinates[:, :2], next_coordinates[-1:, :2]], axis=0)
+
+
+def plot_skill_xy_trajectories(
+        trajectories,
+        *,
+        n_trajs_per_skill: int,
+        snapshot_dir,
+        writer=None,
+        step_itr=None,
+        plot_axis=None,
+        logger=None,
+        label: str = 'SkillXYTrajPlot') -> int:
+    n_trajs_per_skill = max(1, int(n_trajs_per_skill))
+    step_itr = int(step_itr or 0)
+    if snapshot_dir is None:
+        raise ValueError('snapshot_dir is required for skill XY trajectory plotting')
+
+    records = []
+    for idx, trajectory in enumerate(trajectories):
+        xy = extract_xy_trajectory(trajectory)
+        if xy is None:
+            continue
+        records.append((idx // n_trajs_per_skill, idx % n_trajs_per_skill, xy))
+
+    if not records:
+        _maybe_warn(logger, 'Skill XY trajectory plot skipped: no valid coordinates were collected.')
+        return 0
+
+    with utils.FigManager(snapshot_dir, step_itr, label, writer=writer, global_step=step_itr) as fm:
+        ax = fm.ax
+        try:
+            from matplotlib import colormaps
+            cmap = colormaps.get_cmap('tab20')
+        except Exception:
+            from matplotlib import cm
+            cmap = cm.get_cmap('tab20')
+        for skill_idx, _traj_idx, xy in records:
+            color = cmap(skill_idx % 20)
+            ax.plot(
+                xy[:, 0],
+                xy[:, 1],
+                color=color,
+                alpha=0.72,
+                linewidth=1.1,
+            )
+            ax.scatter(xy[0, 0], xy[0, 1], color=color, marker='.', s=20, alpha=0.7)
+            ax.scatter(xy[-1, 0], xy[-1, 1], color=color, marker='x', s=24, alpha=0.9)
+
+        ax.set_xlabel('x')
+        ax.set_ylabel('y')
+        ax.set_title(f'Skill XY trajectories ({n_trajs_per_skill} rollouts/skill)')
+        _set_xy_plot_axis(ax, [xy for _, _, xy in records], plot_axis)
+
+    return len(records)
+
+
+def _set_xy_plot_axis(ax, trajectories, plot_axis):
+    if isinstance(plot_axis, str) and plot_axis == 'free':
+        ax.axis('scaled')
+        return
+    if plot_axis is not None:
+        plot_axis = list(plot_axis)
+        if len(plot_axis) == 4:
+            ax.axis(plot_axis)
+            ax.set_aspect('equal', adjustable='box')
+            return
+
+    coords = np.concatenate(trajectories, axis=0)
+    x_min, y_min = np.min(coords, axis=0)
+    x_max, y_max = np.max(coords, axis=0)
+    span = max(float(x_max - x_min), float(y_max - y_min), 1.0)
+    pad = 0.05 * span
+    ax.set_xlim(float(x_min - pad), float(x_max + pad))
+    ax.set_ylim(float(y_min - pad), float(y_max + pad))
+    ax.set_aspect('equal', adjustable='box')
+
+
 def save_image_grid(agent, trajectories, n_eval_skills: int, n_trajs_per_skill: int, *, snapshot_dir=None, writer=None, step_itr=None) -> None:
     """Save a grid of sampled frames for qualitative inspection when observations are image-like."""
     import cv2
@@ -1198,4 +1293,14 @@ def _agent_attr(agent, name, default=None):
 
 def _maybe_log(logger, message):
     if logger is not None:
+        logger.info(message)
+
+
+def _maybe_warn(logger, message):
+    if logger is None:
+        return
+    warn = getattr(logger, 'warning', None)
+    if callable(warn):
+        warn(message)
+    else:
         logger.info(message)

@@ -79,6 +79,15 @@ def get_parser() -> argparse.ArgumentParser:
         default='bimanual_joint_position',
         choices=['bimanual_joint_position', 'bimanual_ee_pose', 'bimanual_relaxed_ik'],
     )
+    parser.add_argument(
+        '--ogbench-video-source',
+        dest='ogbench_video_source',
+        type=str,
+        default='blog',
+        choices=['blog', 'render', 'front', 'front_pixels', 'observation'],
+    )
+    parser.add_argument('--ogbench-video-render-size', dest='ogbench_video_render_size', type=int, default=256)
+    parser.add_argument('--ogbench-video-opaque-arm', dest='ogbench_video_opaque_arm', type=int, default=1, choices=[0, 1])
     parser.add_argument('--safety-enabled', dest='safety_enabled', type=int, default=0, choices=[0, 1])
     parser.add_argument('--safety-mode', dest='safety_mode', type=str, default='sim', choices=['off', 'sim', 'shadow', 'real'])
     parser.add_argument('--safety-lbsgd-enabled', dest='safety_lbsgd_enabled', type=int, default=1, choices=[0, 1])
@@ -127,6 +136,12 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument('--trans_optimization_epochs', type=int, default=200)
     parser.add_argument('--parallel_sampler_enabled', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--parallel_sampler_num_workers', type=int, default=0)
+    parser.add_argument(
+        '--parallel_sampler_start_method',
+        type=str,
+        default='auto',
+        choices=['auto', 'fork', 'spawn', 'forkserver'],
+    )
     parser.add_argument('--parallel_sampler_fail_open', type=int, default=1, choices=[0, 1])
     parser.add_argument('--eval_parallel_sampler_enabled', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--eval_video_parallel_sampler_enabled', type=int, default=1, choices=[0, 1])
@@ -166,6 +181,8 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument('--num_video_repeats', type=int, default=2)
     parser.add_argument('--eval_record_video', type=int, default=1)
     parser.add_argument('--eval_plot_axis', type=float, default=None, nargs='*')
+    parser.add_argument('--eval_skill_xy_plot', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--eval_skill_xy_plot_rollouts_per_skill', type=int, default=3)
     parser.add_argument('--video_skip_frames', type=int, default=1)
     parser.add_argument('--motion-analysis-enabled', dest='motion_analysis_enabled', type=int, default=0, choices=[0, 1])
     parser.add_argument('--motion-analysis-video-path', dest='motion_analysis_video_path', type=str, default='')
@@ -179,6 +196,10 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument('--motion-analysis-smooth-window', dest='motion_analysis_smooth_window', type=int, default=5)
     parser.add_argument('--motion-analysis-large-motion-threshold',
                         dest='motion_analysis_large_motion_threshold', type=float, default=2.0)
+    parser.add_argument('--motion-analysis-video-pixel-knn-k',
+                        dest='motion_analysis_video_pixel_knn_k', type=int, default=8)
+    parser.add_argument('--motion-analysis-video-pixel-max-points',
+                        dest='motion_analysis_video_pixel_max_points', type=int, default=2048)
     parser.add_argument('--motion-analysis-eps', dest='motion_analysis_eps', type=float, default=1e-8)
 
     parser.add_argument('--dim_skill', type=int, default=2)
@@ -239,6 +260,8 @@ def get_parser() -> argparse.ArgumentParser:
                         help='which latent to use for phi(s): traj encoder mean or pixel encoder feat')
     parser.add_argument('--idk_groups', type=int, default=1,
                         help='compute kernel mean with high samples by split to n groups')
+    parser.add_argument('--idk_nce_aux_weight', type=float, default=0.1,
+                        help='IDK-CSD auxiliary NCE weight; METRA direction loss remains the main objective')
     parser.add_argument('--kernel_map', action="store_true", default=False,
                         help='use kernel to map state encoder')
     parser.add_argument('--use_novelty_reward', action="store_true", default=False,
@@ -409,6 +432,8 @@ def make_config_from_args(args, cls=MetraConfig) -> MetraConfig:
         'motion_analysis_fixed_tau_p': 'fixed_tau_p',
         'motion_analysis_smooth_window': 'smooth_window',
         'motion_analysis_large_motion_threshold': 'large_motion_threshold',
+        'motion_analysis_video_pixel_knn_k': 'video_pixel_knn_k',
+        'motion_analysis_video_pixel_max_points': 'video_pixel_max_points',
         'motion_analysis_eps': 'eps',
     }
     for arg_name, cfg_name in motion_arg_map.items():
@@ -494,6 +519,8 @@ def make_config_from_args(args, cls=MetraConfig) -> MetraConfig:
         raise ValueError("eval_structure_metrics_reset_perturb_scale must be >= 0")
     if cfg.log.eval_structure_metrics_degenerate_policy not in ('skip', 'warn_compute'):
         raise ValueError("eval_structure_metrics_degenerate_policy must be skip or warn_compute")
+    if cfg.log.eval_skill_xy_plot_rollouts_per_skill < 1:
+        raise ValueError("eval_skill_xy_plot_rollouts_per_skill must be >= 1")
     if cfg.motion_analysis.resize_h < 1 or cfg.motion_analysis.resize_w < 1:
         raise ValueError("motion_analysis resize_h/resize_w must be >= 1")
     if cfg.motion_analysis.blur_kernel < 1:
@@ -502,6 +529,10 @@ def make_config_from_args(args, cls=MetraConfig) -> MetraConfig:
         raise ValueError("motion_analysis frame_gap must be >= 1")
     if cfg.motion_analysis.smooth_window < 1:
         raise ValueError("motion_analysis smooth_window must be >= 1")
+    if cfg.motion_analysis.video_pixel_knn_k < 1:
+        raise ValueError("motion_analysis video_pixel_knn_k must be >= 1")
+    if cfg.motion_analysis.video_pixel_max_points < 2:
+        raise ValueError("motion_analysis video_pixel_max_points must be >= 2")
     if cfg.motion_analysis.pixel_threshold_mode not in ('adaptive', 'fixed'):
         raise ValueError("motion_analysis pixel_threshold_mode must be one of {'adaptive', 'fixed'}")
     if cfg.motion_analysis.eps <= 0:

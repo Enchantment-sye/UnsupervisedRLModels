@@ -1,6 +1,8 @@
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.abspath("src"))
 
 from config.parser import get_parser, make_config_from_args
@@ -13,6 +15,7 @@ def test_parallel_speedup_flags_default_true_when_omitted():
     assert cfg.train.eval_parallel_sampler_enabled is True
     assert cfg.train.async_video_encoding is True
     assert cfg.train.replay_staging_enabled is True
+    assert cfg.train.parallel_sampler_start_method == "auto"
 
 
 def test_parallel_speedup_flags_true_when_present():
@@ -28,6 +31,25 @@ def test_parallel_speedup_flags_true_when_present():
     assert cfg.train.eval_parallel_sampler_enabled is True
     assert cfg.train.async_video_encoding is True
     assert cfg.train.replay_staging_enabled is True
+
+
+@pytest.mark.parametrize("method", ["fork", "spawn", "forkserver"])
+def test_parallel_sampler_start_method_can_be_set(method):
+    args = get_parser().parse_args([
+        "--parallel_sampler_start_method",
+        method,
+    ])
+    cfg = make_config_from_args(args)
+
+    assert cfg.train.parallel_sampler_start_method == method
+
+
+def test_parallel_sampler_start_method_rejects_invalid_value():
+    with pytest.raises(SystemExit):
+        get_parser().parse_args([
+            "--parallel_sampler_start_method",
+            "bad-method",
+        ])
 
 
 def test_parallel_speedup_flags_can_be_disabled_explicitly():

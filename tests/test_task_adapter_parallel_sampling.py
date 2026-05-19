@@ -6,6 +6,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.abspath("src"))
 
+import core.task_adapter as task_adapter_module
 from core.task_adapter import SkillDiscoveryTaskAdapter
 
 
@@ -64,6 +65,7 @@ class _Collector:
         self.collect_calls = 0
         self.collect_fixed_calls = 0
         self.fixed_state_record_pixeled = None
+        self.fixed_video_frame_source = None
 
     def collect(self, policy, *, target_num_trajectories, sample_extra_fn):
         self.collect_calls += 1
@@ -85,6 +87,7 @@ class _Collector:
             reset_perturbations=None):
         self.collect_fixed_calls += 1
         self.fixed_state_record_pixeled = state_record_pixeled
+        self.fixed_video_frame_source = video_frame_source
         if self.fail:
             raise RuntimeError("collector boom")
         assert deterministic_policy in (True, False)
@@ -159,6 +162,103 @@ def test_kitchen_disables_generic_process_parallel_sampler():
         for_eval=True,
         state_record_pixeled=False,
     ) is True
+
+
+def test_ogbench_visual_uses_generic_process_parallel_sampler():
+    adapter = _adapter(
+        _cfg(
+            task="ogbench_scene",
+            encoder=1,
+            parallel_sampler_enabled=True,
+            eval_parallel_sampler_enabled=True,
+        )
+    )
+
+    assert adapter._should_use_generic_parallel_sampler(
+        for_eval=False,
+        state_record_pixeled=False,
+    ) is True
+    assert adapter._should_use_generic_parallel_sampler(
+        for_eval=True,
+        state_record_pixeled=False,
+    ) is True
+    assert adapter._should_use_generic_parallel_sampler(
+        for_eval=True,
+        state_record_pixeled=True,
+    ) is True
+
+
+def test_ogbench_video_reset_perturbations_use_same_seed():
+    adapter = _adapter(_cfg(task="ogbench_scene", encoder=1, seed=42))
+
+    perturbations = adapter._build_ogbench_video_reset_perturbations(3)
+
+    assert perturbations == [
+        (1000045, 1.0),
+        (1000045, 1.0),
+        (1000045, 1.0),
+    ]
+
+
+def test_ogbench_render_video_eval_does_not_require_isaaclab_warmup(monkeypatch):
+    cfg = _cfg(
+        task="ogbench_scene",
+        encoder=1,
+        seed=42,
+        sac_discount=0.99,
+        num_video_repeats=1,
+        eval_record_video=1,
+        video_skip_frames=1,
+        render_size=128,
+        async_video_encoding=False,
+        eval_skill_xy_plot=False,
+        eval_structure_metrics=False,
+        motion_analysis=SimpleNamespace(enabled=0),
+    )
+    env = SimpleNamespace(
+        spec=object(),
+        calc_eval_metrics=lambda *args, **kwargs: {},
+        set_video_capture_active=lambda active: captured.setdefault("capture_modes", []).append(active),
+        capture_video_frame=lambda source=None: (_ for _ in ()).throw(
+            AssertionError("OGBench eval should not call IsaacLab warmup capture")
+        ),
+    )
+    adapter = SkillDiscoveryTaskAdapter(
+        cfg,
+        env=env,
+        agent=SimpleNamespace(sac_trainer=SimpleNamespace(skill_policy=_Policy())),
+        work_dir="/tmp",
+        logger=_Logger(),
+    )
+    writer = SimpleNamespace(add_scalar=lambda *args, **kwargs: None)
+    captured = {}
+    coverage_path = _path()
+
+    monkeypatch.setattr(adapter, "collect_policy_coverage_trajectories", lambda total_epoch: [coverage_path])
+
+    def collect_policy_trajectories(extras, **kwargs):
+        captured["video_frame_source"] = kwargs.get("video_frame_source")
+        captured["reset_perturbations"] = kwargs.get("reset_perturbations")
+        return [_path() for _ in extras]
+
+    monkeypatch.setattr(adapter, "collect_policy_trajectories", collect_policy_trajectories)
+    monkeypatch.setattr(task_adapter_module.TrajectoryBatch, "from_trajectory_list", lambda *args, **kwargs: object())
+    monkeypatch.setattr(task_adapter_module.utils, "log_performance_ex", lambda *args, **kwargs: {"scalars": {}})
+    monkeypatch.setattr(task_adapter_module.utils, "record_video", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        task_adapter_module.utils,
+        "trajectories_to_video_tensor",
+        lambda *args, **kwargs: np.zeros((1, 1, 3, 128, 128), dtype=np.uint8),
+    )
+    monkeypatch.setattr(task_adapter_module.video_motion, "compute_video_pixel_motion_metrics", lambda *args, **kwargs: {})
+
+    result = adapter._evaluate_impl(0, 0, writer, log_policy_coverage_to_writer=False)
+
+    assert len(result["trajectories"]) == 1
+    assert result["trajectories"][0] is coverage_path
+    assert captured["video_frame_source"] == "blog"
+    assert captured["reset_perturbations"] == [(1000045, 1.0)] * 9
+    assert captured["capture_modes"] == [True, False]
 
 
 def test_kitchen_train_parallel_sampler_calls_kitchen_collector(monkeypatch):
@@ -276,3 +376,29 @@ def test_eval_video_parallel_sampler_uses_fixed_collector(monkeypatch):
     assert len(paths) == 1
     assert collector.collect_fixed_calls == 1
     assert collector.fixed_state_record_pixeled is True
+
+
+def test_ogbench_visual_video_eval_parallel_sampler_uses_fixed_collector(monkeypatch):
+    collector = _Collector()
+    adapter = _adapter(
+        _cfg(
+            task="ogbench_scene",
+            encoder=1,
+            eval_parallel_sampler_enabled=True,
+            eval_video_parallel_sampler_enabled=True,
+        )
+    )
+    monkeypatch.setattr(adapter, "_get_generic_parallel_collector", lambda: collector)
+
+    paths = adapter.collect_policy_trajectories(
+        [{"skill": np.asarray([1.0, 0.0], dtype=np.float32)}],
+        deterministic_policy=True,
+        rollout_seed=1,
+        state_record_pixeled=True,
+        video_frame_source="blog",
+    )
+
+    assert len(paths) == 1
+    assert collector.collect_fixed_calls == 1
+    assert collector.fixed_state_record_pixeled is True
+    assert collector.fixed_video_frame_source == "blog"

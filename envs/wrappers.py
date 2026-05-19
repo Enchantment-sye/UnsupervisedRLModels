@@ -1,4 +1,5 @@
 import atexit
+import pickle
 import sys
 import traceback
 from collections import OrderedDict, deque
@@ -800,6 +801,14 @@ def _cloudpickle_can_roundtrip_code_objects():
     return True
 
 
+def _pickle_can_roundtrip_constructor(constructor):
+    try:
+        pickle.loads(pickle.dumps(constructor))
+    except Exception:
+        return False
+    return True
+
+
 class Async:
     # Message types for communication via the pipe.
     _ACCESS = 1
@@ -808,25 +817,46 @@ class Async:
     _CLOSE = 4
     _EXCEPTION = 5
 
-    def __init__(self, constructor, strategy="thread"):
+    def __init__(self, constructor, strategy="thread", start_method=None):
         self._ctor = constructor
         self._pickled_ctor = None
         if strategy == "process":
             import multiprocessing as mp
 
-            pickled_ctor = _try_cloudpickle_dump(constructor)
-            if pickled_ctor is not None:
-                context = mp.get_context("spawn")
-                self._ctor = None
-                self._pickled_ctor = pickled_ctor
-            else:
+            if start_method is not None:
+                start_method = str(start_method).strip().lower()
+                if start_method not in ("fork", "spawn", "forkserver"):
+                    raise ValueError(f"Unsupported process start method: {start_method!r}")
                 try:
-                    context = mp.get_context("fork")
-                except ValueError as exc:  # pragma: no cover - non-POSIX fallback.
+                    context = mp.get_context(start_method)
+                except ValueError as exc:
                     raise RuntimeError(
-                        "Process Async requires a cloudpickle version compatible "
-                        "with this Python runtime, or a platform with fork support."
+                        f"Process Async start_method={start_method!r} is not available on this platform."
                     ) from exc
+                if start_method in ("spawn", "forkserver"):
+                    pickled_ctor = _try_cloudpickle_dump(constructor)
+                    if pickled_ctor is not None:
+                        self._ctor = None
+                        self._pickled_ctor = pickled_ctor
+                    elif not _pickle_can_roundtrip_constructor(constructor):
+                        raise RuntimeError(
+                            f"Process Async with start_method={start_method!r} requires a "
+                            "cloudpickle-serializable or standard-pickleable constructor."
+                        )
+            else:
+                pickled_ctor = _try_cloudpickle_dump(constructor)
+                if pickled_ctor is not None:
+                    context = mp.get_context("spawn")
+                    self._ctor = None
+                    self._pickled_ctor = pickled_ctor
+                else:
+                    try:
+                        context = mp.get_context("fork")
+                    except ValueError as exc:  # pragma: no cover - non-POSIX fallback.
+                        raise RuntimeError(
+                            "Process Async requires a cloudpickle version compatible "
+                            "with this Python runtime, or a platform with fork support."
+                        ) from exc
         elif strategy == "thread":
             import multiprocessing.dummy as context
         else:

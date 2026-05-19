@@ -61,6 +61,28 @@ def _make_official_metra_kitchen_env(config):
     return env
 
 
+def _make_ogbench_env(config):
+    from envs.ogbench_env import OGBenchEnv
+
+    render_size = _get_config_attr(config, "render_size", 64)
+    env = OGBenchEnv(
+        task_name=_get_config_attr(config, "task", "ogbench_scene"),
+        seed=_get_config_attr(config, "seed", 0),
+        action_repeat=_get_config_attr(config, "action_repeat", 1),
+        size=(render_size, render_size),
+        video_size=_get_config_attr(config, "ogbench_video_render_size", render_size),
+        video_source=_get_config_attr(config, "ogbench_video_source", "blog"),
+        video_opaque_arm=_get_config_attr(config, "ogbench_video_opaque_arm", 1),
+        encoder=_get_config_attr(config, "encoder", 0),
+        flatten_obs=_get_config_attr(config, "flatten_obs", 1),
+    )
+    env = NormalizeAction(env)
+    env = TimeLimit(env, _get_config_attr(config, "time_limit", 0))
+    if _get_config_attr(config, "framestack", 1) > 1:
+        env = FrameStack(env, k=_get_config_attr(config, "framestack", 1))
+    return env
+
+
 def make_env(mode, config, llm_packages=None):
     if should_use_isaaclab_backend(config):
         env = _make_isaaclab_env(mode, config)
@@ -73,6 +95,8 @@ def make_env(mode, config, llm_packages=None):
     task_name = _get_config_attr(config, "task", "")
     if task_name in ("d4rl_kitchen", "kitchen", "metra_kitchen"):
         return _make_official_metra_kitchen_env(config)
+    if isinstance(task_name, str) and task_name.startswith("ogbench_"):
+        return _make_ogbench_env(config)
 
     if "_" not in task_name:
         raise ValueError(

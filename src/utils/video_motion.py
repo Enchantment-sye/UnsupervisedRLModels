@@ -1,3 +1,4 @@
+import math
 import os
 
 import cv2
@@ -141,6 +142,293 @@ def compute_frame_deltas(processed_frames, frame_gap=1):
     if frames.shape[0] <= frame_gap:
         return np.zeros((0,) + frames.shape[1:], dtype=np.float32)
     return np.abs(frames[frame_gap:] - frames[:-frame_gap])
+
+
+VIDEO_PIXEL_SKIP_NONE = 0
+VIDEO_PIXEL_SKIP_NO_VIDEOS = 1
+VIDEO_PIXEL_SKIP_INSUFFICIENT_VALID_VIDEOS = 2
+VIDEO_PIXEL_SKIP_TOO_FEW_CLUSTERS = 3
+VIDEO_PIXEL_SKIP_NONFINITE_DISTANCE = 4
+VIDEO_PIXEL_SKIP_INSUFFICIENT_MOTION_POINTS = 5
+
+
+def _cfg_value(cfg, name, default):
+    return getattr(cfg, name, default)
+
+
+def _iter_video_entries(video_list):
+    if video_list is None:
+        return
+    for idx, entry in enumerate(video_list):
+        if isinstance(entry, dict):
+            frames = entry.get('frames')
+            video_id = entry.get('video_id', f'video_{idx:03d}')
+        else:
+            frames = entry
+            video_id = f'video_{idx:03d}'
+        yield idx, video_id, frames
+
+
+def _preprocess_video_for_pixel_metrics(frames, cfg):
+    if frames is None or len(frames) == 0:
+        return None
+
+    processed = np.asarray([
+        preprocess_frame(
+            frame,
+            resize_h=_cfg_value(cfg, 'resize_h', 128),
+            resize_w=_cfg_value(cfg, 'resize_w', 128),
+            blur_kernel=_cfg_value(cfg, 'blur_kernel', 3),
+        )
+        for frame in frames
+    ], dtype=np.float32)
+    frame_gap = max(1, int(_cfg_value(cfg, 'frame_gap', 1)))
+    motion = compute_frame_deltas(processed, frame_gap=frame_gap)
+    if motion.shape[0] == 0:
+        return None
+    return {
+        'frames': processed[frame_gap:].astype(np.float32, copy=False),
+        'motion': motion.astype(np.float32, copy=False),
+    }
+
+
+def _motion_mse_distance(video_i, video_j, eps):
+    len_i = min(video_i['frames'].shape[0], video_i['motion'].shape[0])
+    len_j = min(video_j['frames'].shape[0], video_j['motion'].shape[0])
+    length = min(len_i, len_j)
+    if length <= 0:
+        return np.nan
+
+    frames_i = video_i['frames'][:length]
+    frames_j = video_j['frames'][:length]
+    motion_i = video_i['motion'][:length]
+    motion_j = video_j['motion'][:length]
+    diff_sq = np.square(frames_i - frames_j, dtype=np.float32)
+    weights = motion_i + motion_j
+    weight_sum = float(np.sum(weights, dtype=np.float64))
+    if not np.isfinite(weight_sum) or weight_sum <= eps:
+        return float(np.mean(diff_sq, dtype=np.float64))
+    return float(np.sum(weights * diff_sq, dtype=np.float64) / (weight_sum + eps))
+
+
+def _pairwise_video_motion_mse(processed_videos, eps):
+    num_videos = len(processed_videos)
+    distances = np.zeros((num_videos, num_videos), dtype=np.float64)
+    for i in range(num_videos):
+        for j in range(i + 1, num_videos):
+            distance = _motion_mse_distance(processed_videos[i], processed_videos[j], eps)
+            distances[i, j] = distance
+            distances[j, i] = distance
+    return distances
+
+
+def _finite_values(values):
+    values = np.asarray(values, dtype=np.float64)
+    return values[np.isfinite(values)]
+
+
+def _compute_medoid_dbi(distance_matrix, labels, eps):
+    unique_labels = [label for label in np.unique(labels) if np.sum(labels == label) >= 2]
+    if len(unique_labels) < 2:
+        return None, VIDEO_PIXEL_SKIP_TOO_FEW_CLUSTERS
+
+    medoids = {}
+    spreads = {}
+    for label in unique_labels:
+        indices = np.flatnonzero(labels == label)
+        intra = distance_matrix[np.ix_(indices, indices)]
+        if not np.all(np.isfinite(intra)):
+            return None, VIDEO_PIXEL_SKIP_NONFINITE_DISTANCE
+        medoid_local = int(np.argmin(np.mean(intra, axis=1)))
+        medoid = int(indices[medoid_local])
+        medoids[label] = medoid
+        spreads[label] = float(np.mean(distance_matrix[medoid, indices]))
+
+    ratios = []
+    for label_i in unique_labels:
+        worst = -np.inf
+        for label_j in unique_labels:
+            if label_i == label_j:
+                continue
+            center_distance = float(distance_matrix[medoids[label_i], medoids[label_j]])
+            if not np.isfinite(center_distance):
+                return None, VIDEO_PIXEL_SKIP_NONFINITE_DISTANCE
+            ratio = (spreads[label_i] + spreads[label_j]) / max(center_distance, eps)
+            worst = max(worst, ratio)
+        if np.isfinite(worst):
+            ratios.append(worst)
+
+    if not ratios:
+        return None, VIDEO_PIXEL_SKIP_TOO_FEW_CLUSTERS
+    return float(np.mean(ratios)), VIDEO_PIXEL_SKIP_NONE
+
+
+def _compute_same_different_stats(distance_matrix, labels, eps):
+    same_distances = []
+    nearest_different = []
+    triplet_correct = 0
+    triplet_total = 0
+
+    for idx in range(distance_matrix.shape[0]):
+        same = np.flatnonzero(labels == labels[idx])
+        same = same[same != idx]
+        different = np.flatnonzero(labels != labels[idx])
+        if same.size:
+            same_distances.extend(distance_matrix[idx, same].tolist())
+        if different.size:
+            nearest_different.append(float(np.min(distance_matrix[idx, different])))
+        for positive_idx in same:
+            positive_distance = float(distance_matrix[idx, positive_idx])
+            negative_distances = distance_matrix[idx, different]
+            finite_negatives = negative_distances[np.isfinite(negative_distances)]
+            if finite_negatives.size == 0 or not np.isfinite(positive_distance):
+                continue
+            triplet_correct += int(np.sum(positive_distance < finite_negatives))
+            triplet_total += int(finite_negatives.size)
+
+    same_values = _finite_values(same_distances)
+    different_values = _finite_values(nearest_different)
+    metrics = {}
+    if same_values.size:
+        metrics['VideoPixelSameSkillMotionMSEMedian'] = float(np.median(same_values))
+        metrics['VideoPixelSameSkillMotionMSEMax'] = float(np.max(same_values))
+    if different_values.size:
+        metrics['VideoPixelNearestDifferentMotionMSEMedian'] = float(np.median(different_values))
+    if same_values.size and different_values.size:
+        same_median = float(np.median(same_values))
+        different_median = float(np.median(different_values))
+        metrics['VideoPixelSameDifferentRatio_MotionMSE'] = float(
+            same_median / max(different_median, eps)
+        )
+    if triplet_total > 0:
+        metrics['VideoPixelTripletAccuracy_MotionMSE'] = float(triplet_correct / triplet_total)
+    return metrics
+
+
+def _pairwise_euclidean_distances(points):
+    points = np.asarray(points, dtype=np.float32)
+    norms = np.sum(points * points, axis=1, dtype=np.float64)
+    gram = (points @ points.T).astype(np.float64)
+    distances_sq = norms[:, None] + norms[None, :] - 2.0 * gram
+    np.maximum(distances_sq, 0.0, out=distances_sq)
+    return np.sqrt(distances_sq, out=distances_sq)
+
+
+def _compute_motion_knn_entropy(processed_videos, cfg, eps):
+    motion_frames = []
+    for video in processed_videos:
+        motion = np.asarray(video['motion'], dtype=np.float32)
+        if motion.size:
+            motion_frames.append(motion.reshape(motion.shape[0], -1))
+    if not motion_frames:
+        return None, VIDEO_PIXEL_SKIP_INSUFFICIENT_MOTION_POINTS
+
+    points = np.concatenate(motion_frames, axis=0)
+    finite_mask = np.all(np.isfinite(points), axis=1)
+    points = points[finite_mask]
+    if points.shape[0] < 2:
+        return None, VIDEO_PIXEL_SKIP_INSUFFICIENT_MOTION_POINTS
+
+    max_points = int(_cfg_value(cfg, 'video_pixel_max_points', 2048) or 0)
+    if max_points > 0 and points.shape[0] > max_points:
+        indices = np.linspace(0, points.shape[0] - 1, max_points, dtype=np.int64)
+        points = points[indices]
+
+    num_points = int(points.shape[0])
+    k = max(1, int(_cfg_value(cfg, 'video_pixel_knn_k', 8)))
+    k = min(k, num_points - 1)
+    distances = _pairwise_euclidean_distances(points)
+    np.fill_diagonal(distances, np.inf)
+    kth_distances = np.partition(distances, kth=k - 1, axis=1)[:, k - 1]
+    kth_distances = kth_distances[np.isfinite(kth_distances)]
+    if kth_distances.size == 0:
+        return None, VIDEO_PIXEL_SKIP_INSUFFICIENT_MOTION_POINTS
+
+    entropy = (
+        math.lgamma(num_points)
+        - math.lgamma(k)
+        + float(np.mean(np.log(kth_distances + eps)))
+    )
+    return float(entropy), VIDEO_PIXEL_SKIP_NONE
+
+
+def compute_video_pixel_motion_metrics(video_list, cfg, num_video_repeats):
+    eps = float(_cfg_value(cfg, 'eps', 1e-8))
+    repeats = max(1, int(num_video_repeats))
+    processed_videos = []
+    labels = []
+    input_video_count = 0 if video_list is None else len(video_list)
+
+    for original_idx, video_id, frames in _iter_video_entries(video_list):
+        processed = _preprocess_video_for_pixel_metrics(frames, cfg)
+        if processed is None:
+            continue
+        processed['video_id'] = video_id
+        processed['original_index'] = int(original_idx)
+        processed_videos.append(processed)
+        labels.append(int(original_idx) // repeats)
+
+    labels = np.asarray(labels, dtype=np.int64)
+    num_videos = len(processed_videos)
+    num_skills = int(len(np.unique(labels))) if labels.size else 0
+    metrics = {
+        'VideoPixelMetricsNumVideos': float(num_videos),
+        'VideoPixelMetricsNumSkills': float(num_skills),
+        'VideoPixelMetricsSkipped': 0.0,
+        'VideoPixelMetricsSkipReasonCode': float(VIDEO_PIXEL_SKIP_NONE),
+        'VideoPixelDBISkipped': 1.0,
+        'VideoPixelDBISkipReasonCode': float(VIDEO_PIXEL_SKIP_TOO_FEW_CLUSTERS),
+        'VideoPixelEntropySkipped': 1.0,
+        'VideoPixelEntropySkipReasonCode': float(VIDEO_PIXEL_SKIP_INSUFFICIENT_MOTION_POINTS),
+    }
+
+    if input_video_count == 0:
+        metrics['VideoPixelMetricsSkipped'] = 1.0
+        metrics['VideoPixelMetricsSkipReasonCode'] = float(VIDEO_PIXEL_SKIP_NO_VIDEOS)
+        return metrics
+    if num_videos < 2:
+        metrics['VideoPixelMetricsSkipped'] = 1.0
+        metrics['VideoPixelMetricsSkipReasonCode'] = float(VIDEO_PIXEL_SKIP_INSUFFICIENT_VALID_VIDEOS)
+        return metrics
+
+    distance_matrix = _pairwise_video_motion_mse(processed_videos, eps)
+    if not np.all(np.isfinite(distance_matrix)):
+        metrics['VideoPixelMetricsSkipped'] = 1.0
+        metrics['VideoPixelMetricsSkipReasonCode'] = float(VIDEO_PIXEL_SKIP_NONFINITE_DISTANCE)
+        return metrics
+
+    stats = _compute_same_different_stats(distance_matrix, labels, eps)
+    metrics.update(stats)
+
+    dbi, dbi_reason = _compute_medoid_dbi(distance_matrix, labels, eps)
+    if dbi is not None and np.isfinite(dbi):
+        metrics['VideoPixelDBI_MotionMSE'] = float(dbi)
+        metrics['VideoPixelDBISkipped'] = 0.0
+        metrics['VideoPixelDBISkipReasonCode'] = float(VIDEO_PIXEL_SKIP_NONE)
+    else:
+        metrics['VideoPixelDBISkipReasonCode'] = float(dbi_reason)
+
+    entropy, entropy_reason = _compute_motion_knn_entropy(processed_videos, cfg, eps)
+    if entropy is not None and np.isfinite(entropy):
+        metrics['VideoPixelEntropy_MotionKNN'] = float(entropy)
+        metrics['VideoPixelEntropySkipped'] = 0.0
+        metrics['VideoPixelEntropySkipReasonCode'] = float(VIDEO_PIXEL_SKIP_NONE)
+    else:
+        metrics['VideoPixelEntropySkipReasonCode'] = float(entropy_reason)
+
+    if (
+        metrics.get('VideoPixelDBISkipped', 1.0) >= 1.0
+        and metrics.get('VideoPixelEntropySkipped', 1.0) >= 1.0
+    ):
+        metrics['VideoPixelMetricsSkipped'] = 1.0
+        metrics['VideoPixelMetricsSkipReasonCode'] = float(
+            max(
+                metrics.get('VideoPixelDBISkipReasonCode', VIDEO_PIXEL_SKIP_TOO_FEW_CLUSTERS),
+                metrics.get('VideoPixelEntropySkipReasonCode', VIDEO_PIXEL_SKIP_INSUFFICIENT_MOTION_POINTS),
+            )
+        )
+
+    return metrics
 
 
 def compute_motion_pixel_threshold(deltas, mode='adaptive', fixed_tau_p=0.04, eps=1e-8):
@@ -299,15 +587,9 @@ def analyze_video_frames(video_frames, video_id, cfg):
     return result
 
 
-def analyze_video_collection(video_list, cfg):
+def analyze_video_collection(video_list, cfg, num_video_repeats=None):
     video_results = []
-    for idx, entry in enumerate(video_list):
-        if isinstance(entry, dict):
-            frames = entry.get('frames')
-            video_id = entry.get('video_id', f'video_{idx:03d}')
-        else:
-            frames = entry
-            video_id = f'video_{idx:03d}'
+    for _, video_id, frames in _iter_video_entries(video_list):
         video_results.append(analyze_video_frames(frames, video_id, cfg))
 
     if video_results:
@@ -315,12 +597,21 @@ def analyze_video_collection(video_list, cfg):
     else:
         mean_ratio = 0.0
 
-    return {
+    result = {
         'video_results': video_results,
         'num_videos': len(video_results),
         'num_valid_videos': sum(1 for item in video_results if item['status'] == 'ok'),
         'mean_large_motion_ratio': mean_ratio,
     }
+    if num_video_repeats is not None:
+        video_pixel_metrics = compute_video_pixel_motion_metrics(
+            video_list,
+            cfg,
+            num_video_repeats=num_video_repeats,
+        )
+        result['video_pixel_metrics'] = video_pixel_metrics
+        result.update(video_pixel_metrics)
+    return result
 
 
 def analyze_montage_video(video_path, discrete, dim_skill, num_video_repeats, cfg, logger=None):
@@ -339,6 +630,7 @@ def analyze_montage_video(video_path, discrete, dim_skill, num_video_repeats, cf
             for idx, video_frames in enumerate(split_videos)
         ],
         cfg,
+        num_video_repeats=num_video_repeats,
     )
     result.update({
         'source_video_path': expanded_path,
@@ -372,3 +664,16 @@ def log_motion_analysis(result, logger=None):
         int(result.get('num_valid_videos', 0)),
         float(result.get('mean_large_motion_ratio', 0.0)),
     )
+    pixel_metrics = result.get('video_pixel_metrics') or {}
+    if pixel_metrics:
+        dbi = pixel_metrics.get('VideoPixelDBI_MotionMSE', float('nan'))
+        entropy = pixel_metrics.get('VideoPixelEntropy_MotionKNN', float('nan'))
+        _log(
+            logger,
+            'info',
+            "[MotionAnalysis] video_pixel_dbi=%.6f video_pixel_entropy=%.6f skipped=%d reason=%d",
+            float(dbi),
+            float(entropy),
+            int(pixel_metrics.get('VideoPixelMetricsSkipped', 0.0)),
+            int(pixel_metrics.get('VideoPixelMetricsSkipReasonCode', 0.0)),
+        )

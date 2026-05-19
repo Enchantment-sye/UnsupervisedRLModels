@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import os
 import time
 from collections import defaultdict
 
@@ -16,6 +17,70 @@ from envs.wrappers import Async
 from utils import utils
 
 
+_AUTO_SAFE_PIXEL_START_METHODS = ("forkserver", "spawn")
+_PROCESS_START_METHODS = ("fork", "spawn", "forkserver")
+
+
+def resolve_parallel_sampler_start_method(cfg):
+    configured = str(getattr(cfg, "parallel_sampler_start_method", "auto") or "auto").strip().lower()
+    if configured not in ("auto", *_PROCESS_START_METHODS):
+        raise ValueError(
+            "parallel_sampler_start_method must be one of: auto, fork, spawn, forkserver"
+        )
+    if configured == "auto":
+        if _needs_safe_pixel_process_start(cfg):
+            return _first_available_start_method(_AUTO_SAFE_PIXEL_START_METHODS)
+        return None
+    if configured == "forkserver":
+        return _first_available_start_method(("forkserver", "spawn"))
+    return _first_available_start_method((configured,))
+
+
+def _needs_safe_pixel_process_start(cfg):
+    return _is_dmc_pixel_task(cfg) or _is_ogbench_visual_task(cfg)
+
+
+def _is_dmc_pixel_task(cfg):
+    task = getattr(cfg, "task", "")
+    return isinstance(task, str) and task.startswith("dmc_") and bool(getattr(cfg, "encoder", 0))
+
+
+def _is_ogbench_visual_task(cfg):
+    task = getattr(cfg, "task", "")
+    return isinstance(task, str) and task.startswith("ogbench_") and bool(getattr(cfg, "encoder", 0))
+
+
+def _bootstrap_ogbench_render_env():
+    os.environ.setdefault("MUJOCO_GL", "egl")
+    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+
+
+def _first_available_start_method(candidates):
+    import multiprocessing as mp
+
+    available = set(mp.get_all_start_methods())
+    for method in candidates:
+        if method in available:
+            return method
+    raise RuntimeError(
+        "None of the requested multiprocessing start methods are available: "
+        + ", ".join(candidates)
+    )
+
+
+class _GenericEnvConstructor:
+    def __init__(self, cfg, worker_id: int):
+        self.cfg = copy.deepcopy(cfg)
+        self.cfg.seed = int(getattr(cfg, "seed", 0)) + int(worker_id)
+
+    def __call__(self):
+        if _is_ogbench_visual_task(self.cfg):
+            _bootstrap_ogbench_render_env()
+        from envs import make_env
+
+        return make_env(mode="train", config=self.cfg)
+
+
 class GenericProcessTrajectoryCollector:
     """Process-parallel collector for standard URL-style single-agent envs."""
 
@@ -23,8 +88,13 @@ class GenericProcessTrajectoryCollector:
         self.cfg = cfg
         requested_workers = int(num_workers if num_workers is not None else getattr(cfg, "n_parallel", 1))
         self._num_workers = max(1, requested_workers)
+        self._process_start_method = resolve_parallel_sampler_start_method(cfg)
         self._workers = [
-            Async(self._make_constructor(worker_id), strategy="process")
+            Async(
+                self._make_constructor(worker_id),
+                strategy="process",
+                start_method=self._process_start_method,
+            )
             for worker_id in range(self._num_workers)
         ]
         self._timing_totals = self._new_timing_totals()
@@ -64,6 +134,12 @@ class GenericProcessTrajectoryCollector:
         if hasattr(policy, "reset"):
             policy.reset()
         policy._force_use_mode_actions = bool(deterministic_policy)
+        worker_video_capture_active = self._should_use_worker_video_capture_mode(
+            state_record_pixeled=state_record_pixeled,
+            video_frame_source=video_frame_source,
+        )
+        if worker_video_capture_active:
+            self._set_worker_video_capture_active(True)
         try:
             paths = self._collect_fixed_impl(
                 policy,
@@ -73,6 +149,8 @@ class GenericProcessTrajectoryCollector:
                 reset_perturbations=reset_perturbations,
             )
         finally:
+            if worker_video_capture_active:
+                self._set_worker_video_capture_active(False)
             if had_force_mode:
                 policy._force_use_mode_actions = old_force_mode
             else:
@@ -243,15 +321,7 @@ class GenericProcessTrajectoryCollector:
         return [path for path in paths_by_index if path is not None]
 
     def _make_constructor(self, worker_id: int):
-        cfg = copy.deepcopy(self.cfg)
-        cfg.seed = int(getattr(self.cfg, "seed", 0)) + int(worker_id)
-
-        def _construct():
-            from envs import make_env
-
-            return make_env(mode="train", config=cfg)
-
-        return _construct
+        return _GenericEnvConstructor(self.cfg, worker_id)
 
     def _policy_actions(self, policy, obs_batch, extras):
         agent_input = obs_batch
@@ -292,6 +362,25 @@ class GenericProcessTrajectoryCollector:
             int(seed),
             float(scale),
         )()
+        self._timing_totals["TimeSamplingEnv"] += time.perf_counter() - started
+
+    def _should_use_worker_video_capture_mode(self, *, state_record_pixeled: bool, video_frame_source):
+        task = getattr(self.cfg, "task", "")
+        return (
+            isinstance(task, str)
+            and task.startswith("ogbench_")
+            and bool(state_record_pixeled)
+            and video_frame_source is not None
+        )
+
+    def _set_worker_video_capture_active(self, active):
+        started = time.perf_counter()
+        promises = [
+            worker.call("set_video_capture_active", bool(active))
+            for worker in self._workers
+        ]
+        for promise in promises:
+            promise()
         self._timing_totals["TimeSamplingEnv"] += time.perf_counter() - started
 
     def _step_slots(self, slots, actions):

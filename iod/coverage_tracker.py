@@ -23,10 +23,17 @@ class CoverageTracker:
         return "kitchen" in self.env_name.lower()
 
     @property
+    def _is_ogbench_scene(self):
+        env_name = self.env_name.lower()
+        return env_name.startswith("ogbench_") and "scene" in env_name
+
+    @property
     def _coord_dims(self):
         return 1 if "cheetah" in self.env_name.lower() else 2
 
     def update_train_paths(self, paths):
+        if self._is_ogbench_scene:
+            return
         for path in paths or []:
             item = self._compress_path(path)
             if item is None:
@@ -38,6 +45,8 @@ class CoverageTracker:
                 self.total.update(item)
 
     def compute_policy_metrics(self, eval_paths):
+        if self._is_ogbench_scene:
+            return {}
         if self._is_kitchen:
             mask, missing = self._union_kitchen_masks(eval_paths)
             metrics = {"KitchenPolicyTaskCoverage": int(mask.bit_count())}
@@ -51,6 +60,8 @@ class CoverageTracker:
         return metrics
 
     def compute_queue_metrics(self):
+        if self._is_ogbench_scene:
+            return {}
         if self._is_kitchen:
             mask = 0
             for item in self.queue:
@@ -64,6 +75,8 @@ class CoverageTracker:
         return self._with_missing_info({"QueueStateCoverageXYBins": int(len(bins))})
 
     def compute_total_metrics(self):
+        if self._is_ogbench_scene:
+            return {}
         if self._is_kitchen:
             metrics = {"KitchenTotalTaskCoverage": int(int(self.total).bit_count())}
             return self._with_missing_info(metrics)

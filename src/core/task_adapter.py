@@ -1,9 +1,10 @@
 from abc import ABC, abstractmethod
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import numpy as np
 import torch
 import os
 from envs import should_use_isaaclab_backend
+from envs.ogbench_scene_kitchen_like_eval import is_ogbench_scene_metric_key
 from utils import utils, video_motion
 from data_structs.trajectory_batch import TrajectoryBatch
 from workers.rollout import SkillRolloutWorker
@@ -17,11 +18,37 @@ from core.metrics.trajectory_structure import (
     interval_skip_metrics,
     video_trajectories_are_suitable,
 )
+from core.metra_viz import plot_skill_xy_trajectories
 
 
 def _task_requests_galaxea_sim(config) -> bool:
     task = getattr(config, 'task', '')
     return isinstance(task, str) and task.startswith('galaxea_')
+
+
+def _task_requests_ogbench_visual(config) -> bool:
+    task = getattr(config, 'task', '')
+    return isinstance(task, str) and task.startswith('ogbench_') and bool(getattr(config, 'encoder', 0))
+
+
+def _task_requests_ogbench_scene(config) -> bool:
+    task = getattr(config, 'task', '')
+    return isinstance(task, str) and task.startswith('ogbench_') and 'scene' in task
+
+
+@contextmanager
+def _temporary_video_capture_mode(env, enabled):
+    setter = getattr(env, 'set_video_capture_active', None)
+    if not enabled or not callable(setter):
+        yield
+        return
+
+    setter(True)
+    try:
+        yield
+    finally:
+        setter(False)
+
 
 class TaskAdapter(ABC):
     def __init__(self, config, env, agent, work_dir, logger):
@@ -615,6 +642,11 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
              for k, v in performance['scalars'].items():
                 writer.add_scalar('eval/' + k, v, step_itr)
         self._log_d4rl_kitchen_eval_metrics(trajectories, step_itr, writer)
+        ogbench_scene_metrics = self._log_ogbench_scene_kitchen_like_eval_metrics(
+            trajectories,
+            step_itr,
+            writer,
+        )
         policy_coverage_metrics = self.compute_policy_coverage_metrics(trajectories)
         tracker = getattr(self, 'coverage_tracker', None)
         if tracker is not None:
@@ -625,6 +657,7 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
             policy_coverage_metrics.update(tracker_metrics)
         if log_policy_coverage_to_writer:
             self.log_policy_coverage_metrics_to_writer(policy_coverage_metrics, step_itr, writer)
+        self._maybe_log_skill_xy_trajectories(step_itr, total_epoch, writer)
 
         # 2. Video Recording / Motion Analysis
         motion_analysis_enabled = bool(self.cfg.motion_analysis.enabled)
@@ -648,30 +681,47 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
 
             video_frame_source = None
             video_view_context = nullcontext()
+            warmup_render_capture_fn = None
             if should_use_isaaclab_backend(self.cfg):
                 video_frame_source = getattr(self.cfg, 'isaaclab_video_source', 'observation')
                 if video_frame_source == 'render':
                     try:
                         from envs.isaaclab.viewer_runtime import (
                             temporary_video_viewer_preset,
-                            warmup_render_capture,
+                            warmup_render_capture as _warmup_render_capture,
                         )
                     except ImportError:
                         video_view_context = nullcontext()
                     else:
+                        warmup_render_capture_fn = _warmup_render_capture
                         video_view_context = temporary_video_viewer_preset(
                             self.env,
                             getattr(self.cfg, 'isaaclab_video_viewer_preset', 'inherit'),
                         )
             elif _task_requests_galaxea_sim(self.cfg):
                 video_frame_source = getattr(self.cfg, 'galaxea_sim_video_source', 'observation')
+            elif _task_requests_ogbench_scene(self.cfg):
+                video_frame_source = getattr(self.cfg, 'ogbench_video_source', 'blog')
 
-            with video_view_context:
+            video_shape = self._get_video_record_shape()
+
+            video_reset_perturbations = None
+            if _task_requests_ogbench_scene(self.cfg):
+                video_reset_perturbations = self._build_ogbench_video_reset_perturbations(
+                    len(video_extras),
+                )
+
+            video_capture_context = _temporary_video_capture_mode(
+                self.env,
+                _task_requests_ogbench_scene(self.cfg),
+            )
+            with video_view_context, video_capture_context:
                 if (
                     video_frame_source == 'render'
                     and hasattr(self.env, 'capture_video_frame')
+                    and warmup_render_capture_fn is not None
                 ):
-                    warmup_render_capture(
+                    warmup_render_capture_fn(
                         lambda: self.env.capture_video_frame(source=video_frame_source),
                     )
                 video_trajectories = self.collect_policy_trajectories(
@@ -680,6 +730,7 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
                     rollout_seed=self.cfg.seed + 100 + total_epoch,
                     state_record_pixeled=True,
                     video_frame_source=video_frame_source,
+                    reset_perturbations=video_reset_perturbations,
                 )
                 video_policy_mode = 'deterministic'
 
@@ -691,28 +742,61 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
                     video_trajectories,
                     n_cols=self._get_video_n_cols(),
                     skip_frames=self.cfg.video_skip_frames,
-                    shape=(self.cfg.render_size, self.cfg.render_size),
+                    shape=video_shape,
                     async_encode=bool(getattr(self.cfg, 'async_video_encoding', False)),
                     logger=self.logger,
                 )
 
+            video_tensor = None
+            video_entries = None
+            video_pixel_metrics = None
+            try:
+                video_tensor = utils.trajectories_to_video_tensor(
+                    video_trajectories,
+                    skip_frames=self.cfg.video_skip_frames,
+                    shape=video_shape,
+                )
+                video_entries = [
+                    {
+                        'video_id': video_motion.format_video_id(idx, self.cfg.num_video_repeats),
+                        'frames': np.transpose(video_tensor[idx], (0, 2, 3, 1)),
+                    }
+                    for idx in range(video_tensor.shape[0])
+                ]
+                video_pixel_metrics = video_motion.compute_video_pixel_motion_metrics(
+                    video_entries,
+                    self.cfg.motion_analysis,
+                    num_video_repeats=self.cfg.num_video_repeats,
+                )
+                for metric_name, metric_value in video_pixel_metrics.items():
+                    if np.isscalar(metric_value) and np.isfinite(float(metric_value)):
+                        writer.add_scalar(f'eval/{metric_name}', float(metric_value), step_itr)
+            except Exception as exc:
+                self.logger.warning("[VideoPixelMetrics] failed during eval: %s", exc)
+
             if motion_analysis_enabled:
                 try:
-                    video_tensor = utils.trajectories_to_video_tensor(
-                        video_trajectories,
-                        skip_frames=self.cfg.video_skip_frames,
-                        shape=(self.cfg.render_size, self.cfg.render_size),
-                    )
-                    motion_result = video_motion.analyze_video_collection(
-                        [
+                    if video_tensor is None:
+                        video_tensor = utils.trajectories_to_video_tensor(
+                            video_trajectories,
+                            skip_frames=self.cfg.video_skip_frames,
+                            shape=video_shape,
+                        )
+                    if video_entries is None:
+                        video_entries = [
                             {
                                 'video_id': video_motion.format_video_id(idx, self.cfg.num_video_repeats),
                                 'frames': np.transpose(video_tensor[idx], (0, 2, 3, 1)),
                             }
                             for idx in range(video_tensor.shape[0])
-                        ],
+                        ]
+                    motion_result = video_motion.analyze_video_collection(
+                        video_entries,
                         self.cfg.motion_analysis,
                     )
+                    if video_pixel_metrics is not None:
+                        motion_result['video_pixel_metrics'] = video_pixel_metrics
+                        motion_result.update(video_pixel_metrics)
                     video_motion.log_motion_analysis(motion_result, logger=self.logger)
                     writer.add_scalar(
                         'eval/MotionLargeMotionFrameRatioMean',
@@ -731,6 +815,7 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
         return {
             'trajectories': trajectories,
             'policy_coverage_metrics': policy_coverage_metrics,
+            'ogbench_scene_kitchen_like_metrics': ogbench_scene_metrics,
         }
 
     def _maybe_log_structure_metrics(
@@ -778,6 +863,42 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
             self.logger.warning("[StructureMetrics] failed during eval; training will continue: %s", exc)
             metrics = exception_skip_metrics(backends, reason=SkipReason.BACKEND_EXCEPTION)
         self._write_structure_metrics(writer, step_itr, metrics)
+
+    def _maybe_log_skill_xy_trajectories(self, step_itr, total_epoch, writer):
+        if not bool(getattr(self.cfg, 'eval_skill_xy_plot', True)):
+            return
+        if not self._task_supports_skill_xy_plot():
+            return
+
+        try:
+            rollouts_per_skill = max(1, int(getattr(self.cfg, 'eval_skill_xy_plot_rollouts_per_skill', 3)))
+            base_skills = self._get_base_video_skills()
+            if len(base_skills) == 0:
+                return
+
+            repeated_skills = np.repeat(base_skills, rollouts_per_skill, axis=0)
+            extras = self.build_skill_extras(repeated_skills)
+            trajectories = self.collect_policy_trajectories(
+                extras,
+                deterministic_policy=True,
+                rollout_seed=int(getattr(self.cfg, 'seed', 0)) + 700000 + int(total_epoch),
+                state_record_pixeled=False,
+            )
+            plot_skill_xy_trajectories(
+                trajectories,
+                n_trajs_per_skill=rollouts_per_skill,
+                snapshot_dir=self.work_dir,
+                writer=writer,
+                step_itr=step_itr,
+                plot_axis=getattr(self.cfg, 'eval_plot_axis', None),
+                logger=self.logger,
+            )
+        except Exception as exc:
+            self.logger.warning("[SkillXYTrajPlot] failed during eval; training will continue: %s", exc)
+
+    def _task_supports_skill_xy_plot(self):
+        task = str(getattr(self.cfg, 'task', '') or '').lower()
+        return task.startswith('dmc_') or 'ant' in task
 
     def _collect_structure_metric_trajectories(self, total_epoch, *, video_trajectories=None, video_policy_mode=None):
         source_metrics = {
@@ -854,6 +975,19 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
         )
         return [(base_seed + idx, scale) for idx in range(int(num_rollouts))]
 
+    def _build_ogbench_video_reset_perturbations(self, num_rollouts):
+        base_seed = int(getattr(self.cfg, 'eval_video_reset_seed', 1000003))
+        seed = int(getattr(self.cfg, 'seed', 0)) + base_seed
+        return [(seed, 1.0) for _ in range(int(num_rollouts))]
+
+    def _get_video_record_shape(self):
+        if _task_requests_ogbench_scene(self.cfg):
+            size = int(getattr(self.cfg, 'ogbench_video_render_size', 0) or 0)
+            if size > 0:
+                return size, size
+        size = int(getattr(self.cfg, 'render_size', 64))
+        return size, size
+
     def _write_structure_metrics(self, writer, step_itr, metrics):
         # This hook only covers the task_adapter training eval path. The legacy
         # src/core/metra.py and metra_evaluation.py paths are intentionally left
@@ -896,6 +1030,8 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
             return {}
 
         raw_metrics = dict(raw_metrics)
+        if any(is_ogbench_scene_metric_key(key) for key in raw_metrics):
+            return {}
         if (
                 'MjNumUniqueCoords' not in raw_metrics
                 and 'PolicyStateCoverageXYBins' not in raw_metrics
@@ -939,6 +1075,35 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
         self.logger.info(message)
         if print_to_stdout:
             print(message)
+
+    def _log_ogbench_scene_kitchen_like_eval_metrics(self, trajectories, step_itr, writer):
+        calc_eval_metrics = getattr(self.env, 'calc_eval_metrics', None)
+        if not callable(calc_eval_metrics):
+            return {}
+
+        raw_metrics = calc_eval_metrics(trajectories, is_option_trajectories=True)
+        if not raw_metrics:
+            return {}
+
+        metrics = {
+            key: value
+            for key, value in dict(raw_metrics).items()
+            if is_ogbench_scene_metric_key(key)
+        }
+        if not metrics:
+            return {}
+
+        for key, value in sorted(metrics.items()):
+            if isinstance(value, (bool, np.bool_)):
+                scalar = float(value)
+            elif np.isscalar(value) and np.isfinite(float(value)):
+                scalar = float(value)
+            else:
+                continue
+            if writer is not None:
+                writer.add_scalar(f'eval/{key}', scalar, step_itr)
+            self.logger.info(f"Step {step_itr}: Eval {key} = {scalar}")
+        return metrics
 
     def _log_d4rl_kitchen_eval_metrics(self, trajectories, step_itr, writer):
         if self.cfg.task not in self._OFFICIAL_KITCHEN_TASKS:
@@ -1022,17 +1187,19 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
             writer.add_scalar('eval_legacy/avg_completed_tasks', avg_completed, step_itr)
             self.logger.info(f"Step {step_itr}: Eval legacy Avg Completed Tasks = {avg_completed:.10f}")
 
-    def _get_video_skills(self):
+    def _get_base_video_skills(self):
+        if not uses_skill_inputs(self.cfg):
+            return np.zeros((1, 0), dtype=np.float32)
+
         if is_finetune_stage(self.cfg) and self.best_skill is not None:
             fixed_skill = np.asarray(self.best_skill, dtype=np.float32)
-            return np.repeat(fixed_skill[None, ...], self.cfg.num_video_repeats, axis=0)
+            return fixed_skill[None, ...]
 
-        if self.cfg.use_hierarchical_skill:
-            video_skills = self.sample_skills(16)
-            return video_skills.repeat(self.cfg.num_video_repeats, axis=0)
+        if getattr(self.cfg, 'use_hierarchical_skill', False):
+            return self.sample_skills(16)
 
         if self.cfg.discrete:
-            video_skills = np.eye(self.cfg.dim_skill)
+            return np.eye(self.cfg.dim_skill, dtype=np.float32)
         else:
             if self.cfg.dim_skill == 2:
                 radius = 1. if self.cfg.unit_length else 1.5
@@ -1042,13 +1209,17 @@ class SkillDiscoveryTaskAdapter(TaskAdapter):
                 video_skills.append([0, 0])
                 for angle in [0, 5, 6, 7]:
                     video_skills.append([radius * np.cos(angle * np.pi / 4), radius * np.sin(angle * np.pi / 4)])
-                video_skills = np.array(video_skills)
+                video_skills = np.asarray(video_skills, dtype=np.float32)
             else:
                 video_skills = np.random.randn(9, self.cfg.dim_skill)
                 if self.cfg.unit_length:
                     video_skills = video_skills / np.linalg.norm(video_skills, axis=1, keepdims=True)
-        
-        return video_skills.repeat(self.cfg.num_video_repeats, axis=0)
+                video_skills = video_skills.astype(np.float32)
+
+        return video_skills
+
+    def _get_video_skills(self):
+        return np.repeat(self._get_base_video_skills(), self.cfg.num_video_repeats, axis=0)
 
     def _get_video_n_cols(self):
         if (
